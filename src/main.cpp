@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <STM32FreeRTOS.h>
 #include <math.h>
+#include <HardwareSerial.h>
 
 #include <Wire.h>
 #include <U8g2lib.h>
@@ -26,6 +27,8 @@ float time_ref = 0.5;
 float target_vel = 0.0f;
 float target_horiz_vel = 0.0f;
 float target_yaw_rate = 0.0f;
+
+HardwareSerial Serial_(PA10, PA9);
 
 // Init MPU6050
 TwoWire Wire2 = TwoWire(PB11, PB10); // For MPU6050
@@ -56,7 +59,8 @@ int x = 0;
 int y = 0;
 
 // Init CAN
-// STM32_CAN Can(PA11, PA12); // PA11/12
+// FDCAN1 is on PI9 (RX) / PH13 (TX) - see HAL_FDCAN_MspInit below.
+// PA11/PA12 are USB_OTG_FS in the cube config now, not CAN.
 // static CAN_message_t TX_msgs[8];
 // static CAN_message_t RX_msgs[8];
 
@@ -109,17 +113,25 @@ extern "C" void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef *hfdcan)
     /* Peripheral clock enable */
     __HAL_RCC_FDCAN_CLK_ENABLE();
 
-    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOI_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
     /**FDCAN1 GPIO Configuration
-    PA11     ------> FDCAN1_RX
-    PA12     ------> FDCAN1_TX
+    PI9     ------> FDCAN1_RX
+    PH13     ------> FDCAN1_TX
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF9_FDCAN1;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOI, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF9_FDCAN1;
+    HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
 
     /* USER CODE BEGIN FDCAN1_MspInit 1 */
 
@@ -144,8 +156,9 @@ static void MX_FDCAN1_Init(void)
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_NO_BRS;
-  // hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  // cube generates FDCAN_MODE_NORMAL here - held in loopback so the tx/rx path
+  // can be exercised without the transceiver. swap back to drive PI9/PH13.
+  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK; // FDCAN_MODE_NORMAL
   hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
@@ -173,7 +186,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_64;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
   {
-    Serial.println("HAL FDCAN init failed");
+    Serial_.println("HAL FDCAN init failed");
     Error_Handler();
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
@@ -190,7 +203,7 @@ static void MX_FDCAN1_Init(void)
 
   if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
   {
-    Serial.println("HAL FDCAN start failed");
+    Serial_.println("HAL FDCAN start failed");
     Error_Handler();
   }
   /* USER CODE END FDCAN1_Init 2 */
@@ -234,8 +247,8 @@ static void CAN_Poll()
 void setup()
 {
   // put your setup code here, to run once:
-  Serial.begin(115200);
-  Serial.println("Starting...");
+  Serial_.begin(115200);
+  Serial_.println("Starting...");
 
   // Init arrays to all zeros
   for (int i = 0; i < history_len * history_int; i++)
@@ -256,16 +269,19 @@ void setup()
     actions[i] = 0.0f;
   }
 
+  Serial_.println("Wire1");
   Wire.setSCL(PB6);
   Wire.setSDA(PB7);
   Wire.setClock(400000);
   Wire.begin();
 
+  Serial_.println("Wire2");
   Wire2.setSCL(PB10);
   Wire2.setSDA(PB11);
   Wire2.setClock(400000);
   Wire2.begin();
 
+  Serial_.println("Begin screens");
   l_screen.setI2CAddress(0x78);
   r_screen.setI2CAddress(0x7A);
 
@@ -275,41 +291,47 @@ void setup()
   l_screen.begin();
   r_screen.begin();
 
+  Serial_.println("Begin MPU");
   mpu.initialize();
-  Serial.println("Testing MPU6050 connection...");
+  Serial_.println("Testing MPU6050 connection...");
   if (mpu.testConnection() == false)
   {
-    Serial.println("MPU6050 connection failed");
+    Serial_.println("MPU6050 connection failed");
     while (true)
       ;
   }
   else
   {
-    Serial.println("MPU6050 connection successful");
+    Serial_.println("MPU6050 connection successful");
   }
 
+  Serial_.println("Begin DMP");
   devStatus = mpu.dmpInitialize();
 
   if (devStatus == 0)
   {
     mpu.CalibrateAccel(6); // Calibration Time: generate offsets and calibrate our MPU6050
     mpu.CalibrateGyro(6);
-    Serial.println("These are the Active offsets: ");
+    Serial_.println("These are the Active offsets: ");
     mpu.PrintActiveOffsets();
-    Serial.println(F("Enabling DMP...")); // Turning ON DMP
+    Serial_.println(F("Enabling DMP...")); // Turning ON DMP
     mpu.setDMPEnabled(true);
 
     MPUIntStatus = mpu.getIntStatus();
 
     /* Set the DMP Ready flag so the main loop() function knows it is okay to use it */
-    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    Serial_.println(F("DMP ready! Waiting for first interrupt..."));
     DMPReady = true;
     packetSize = mpu.dmpGetFIFOPacketSize(); // Get expected DMP packet size for later comparison
   }
 
-  HAL_FDCAN_MspInit(&hfdcan1);
+  Serial_.println("Begin FDCAN");
+  // MX_FDCAN1_Init -> HAL_FDCAN_Init calls HAL_FDCAN_MspInit itself (handle
+  // starts in HAL_FDCAN_STATE_RESET), so don't call MspInit here as well - it
+  // would run the PLL2 stop/reconfigure/start cycle twice.
   MX_FDCAN1_Init();
 
+  Serial_.println("Begin tasks");
   xTaskCreate(Screens, NULL, 2048, NULL, 0, &screenTask);
   xTaskCreate(SensorRead, NULL, 2048, NULL, 0, &sensorTask);
   xTaskCreate(Model, NULL, 2048, NULL, 1, &modelTask);
@@ -511,12 +533,12 @@ static void Model(void *arg)
     // action_range = upper limit - lower limit
     // action_midpoint = (upper limit + lower limit) / 2.0
 
-    // Serial.println("Running model...");
+    // Serial_.println("Running model...");
 
     entry(input, output);
     uint32_t t2 = micros();
-    // Serial.println("Time to run model: ");
-    // Serial.println(t2 - t1);
+    // Serial_.println("Time to run model: ");
+    // Serial_.println(t2 - t1);
 
     // target ~50it/s
     uint32_t remaining_time = 20000 - (t2 - t1);
@@ -530,7 +552,7 @@ static void Model(void *arg)
       actions[i] = output[0][i];
     }
 
-    // Serial.println(remaining_time);
+    // Serial_.println(remaining_time);
 
     vTaskDelay(pdMS_TO_TICKS(remaining_time / 1000));
   }
