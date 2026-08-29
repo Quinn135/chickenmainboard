@@ -44,8 +44,8 @@ uint8_t FIFOBuffer[64]; // FIFO storage buffer
 static const float GYRO_TO_RAD_S = (1.0f / 16.384f) * (float)M_PI / 180.0f; // 0.00106526
 
 // DMP orientation/motion vars
-Quaternion q;        // [w, x, y, z]         Quaternion container
-VectorInt16 aa;      // [x, y, z]            Accel sensor measurements
+Quaternion q; // [w, x, y, z]         Quaternion container
+// VectorInt16 aa;      // [x, y, z]            Accel sensor measurements
 VectorInt16 gg;      // [x, y, z]            Gyro sensor measurements
 VectorFloat gravity; // [x, y, z]            Gravity vector
 float ypr[3];        // [yaw, pitch, roll]   Yaw/Pitch/Roll container and gravity vector
@@ -78,6 +78,64 @@ static const uint32_t CAN_ID_CMD = 0x100;     // mainboard -> all ESCs (broadcas
 static const uint32_t CAN_ID_FB_BASE = 0x200; // ESC n replies on 0x200 + n
 
 /**
+ * @brief System Clock Configuration
+ * @retval None
+ */
+extern "C" void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Supply configuration update enable
+   */
+  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+
+  /** Configure the main internal regulator output voltage
+   */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  while (!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY))
+  {
+  }
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+   * in the RCC_OscInitTypeDef structure.
+   */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 2;
+  RCC_OscInitStruct.PLL.PLLN = 64;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2 | RCC_CLOCKTYPE_D3PCLK1 | RCC_CLOCKTYPE_D1PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
  * @brief FDCAN MSP Initialization
  * This function configures the hardware resources used in this example
  * @param hfdcan: FDCAN handle pointer
@@ -96,14 +154,14 @@ extern "C" void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef *hfdcan)
     /** Initializes the peripherals clock
      */
     PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_FDCAN;
-    PeriphClkInitStruct.PLL2.PLL2M = 4;
-    PeriphClkInitStruct.PLL2.PLL2N = 9;
+    PeriphClkInitStruct.PLL2.PLL2M = 2;
+    PeriphClkInitStruct.PLL2.PLL2N = 12;
     PeriphClkInitStruct.PLL2.PLL2P = 2;
-    PeriphClkInitStruct.PLL2.PLL2Q = 3;
+    PeriphClkInitStruct.PLL2.PLL2Q = 2;
     PeriphClkInitStruct.PLL2.PLL2R = 2;
     PeriphClkInitStruct.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_3;
     PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOMEDIUM;
-    PeriphClkInitStruct.PLL2.PLL2FRACN = 3072.0;
+    PeriphClkInitStruct.PLL2.PLL2FRACN = 0.0;
     PeriphClkInitStruct.FdcanClockSelection = RCC_FDCANCLKSOURCE_PLL2;
     if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
     {
@@ -156,19 +214,17 @@ static void MX_FDCAN1_Init(void)
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_NO_BRS;
-  // cube generates FDCAN_MODE_NORMAL here - held in loopback so the tx/rx path
-  // can be exercised without the transceiver. swap back to drive PI9/PH13.
-  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK; // FDCAN_MODE_NORMAL
+  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
   hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 5;
   hfdcan1.Init.NominalSyncJumpWidth = 2;
-  hfdcan1.Init.NominalTimeSeg1 = 7;
+  hfdcan1.Init.NominalTimeSeg1 = 12;
   hfdcan1.Init.NominalTimeSeg2 = 2;
   hfdcan1.Init.DataPrescaler = 5;
   hfdcan1.Init.DataSyncJumpWidth = 2;
-  hfdcan1.Init.DataTimeSeg1 = 7;
+  hfdcan1.Init.DataTimeSeg1 = 12;
   hfdcan1.Init.DataTimeSeg2 = 2;
   hfdcan1.Init.MessageRAMOffset = 0;
   hfdcan1.Init.StdFiltersNbr = 1;
@@ -227,6 +283,25 @@ static bool CAN_SendActions(const float *a) // 8 floats = 32 bytes, one FD frame
   return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &tx, buf) == HAL_OK;
 }
 
+// static bool CAN_SendTest(const float *a) // 2 floats = 8 bytes, one FD frame
+// {
+//   FDCAN_TxHeaderTypeDef tx = {};
+//   // tx.Identifier = CAN_ID_CMD;
+//   tx.Identifier = CAN_ID_FB_BASE;
+//   tx.IdType = FDCAN_STANDARD_ID;
+//   tx.TxFrameType = FDCAN_DATA_FRAME;
+//   tx.DataLength = FDCAN_DLC_BYTES_8;
+//   tx.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+//   tx.BitRateSwitch = FDCAN_BRS_OFF;
+//   tx.FDFormat = FDCAN_FD_CAN;
+//   tx.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+//   tx.MessageMarker = 0;
+
+//   uint8_t buf[8];
+//   memcpy(buf, a, sizeof(buf));
+//   return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &tx, buf) == HAL_OK;
+// }
+
 static void CAN_Poll()
 {
   FDCAN_RxHeaderTypeDef rx;
@@ -235,7 +310,10 @@ static void CAN_Poll()
   {
     if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx, buf) != HAL_OK)
       break;
+
+    uint32_t ident = rx.Identifier;
     uint32_t idx = rx.Identifier - CAN_ID_FB_BASE;
+
     if (idx < 8)
     {
       memcpy(&joint_pos[idx], &buf[0], 4);
@@ -246,6 +324,8 @@ static void CAN_Poll()
 
 void setup()
 {
+  SystemClock_Config();
+
   // put your setup code here, to run once:
   Serial_.begin(115200);
   Serial_.println("Starting...");
@@ -312,8 +392,8 @@ void setup()
   {
     mpu.CalibrateAccel(6); // Calibration Time: generate offsets and calibrate our MPU6050
     mpu.CalibrateGyro(6);
-    Serial_.println("These are the Active offsets: ");
-    mpu.PrintActiveOffsets();
+    // Serial_.println("These are the Active offsets: ");
+    // mpu.PrintActiveOffsets();
     Serial_.println(F("Enabling DMP...")); // Turning ON DMP
     mpu.setDMPEnabled(true);
 
@@ -339,16 +419,16 @@ void setup()
   vTaskStartScheduler();
 }
 
-void drawStr(U8G2 screen, String str)
+void drawStr(U8G2 *screen, String str)
 {
-  screen.setFont(u8g2_font_6x13_tf);
+  screen->setFont(u8g2_font_6x13_tf);
 
   int line_len = 128 / 6;
   int num_lines = str.length() / line_len + 1;
 
   for (int i = 0; i < num_lines; i++)
   {
-    screen.drawStr(0, (i + 1) * 13, str.substring(i * line_len, min((i + 1) * line_len, int(str.length()))).c_str());
+    screen->drawStr(0, (i + 1) * 13, str.substring(i * line_len, min((i + 1) * line_len, int(str.length()))).c_str());
   }
 }
 
@@ -410,16 +490,27 @@ static void SensorRead(void *arg)
     if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer))
     {
       // Get the Latest packet
-      mpu.dmpGetQuaternion(&q, FIFOBuffer);
+      Quaternion local_q;        // [w, x, y, z]         Quaternion container
+      VectorInt16 local_gg;      // [x, y, z]            Gyro sensor measurements
+      VectorFloat local_gravity; // [x, y, z]            Gravity vector
 
-      mpu.dmpGetGravity(&gravity, &q); // gravity vector
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+      mpu.dmpGetQuaternion(&local_q, FIFOBuffer);
 
-      mpu.dmpGetGyro(&gg, FIFOBuffer);
+      mpu.dmpGetGravity(&local_gravity, &local_q); // gravity vector
+      mpu.dmpGetYawPitchRoll(ypr, &local_q, &local_gravity);
+
+      mpu.dmpGetGyro(&local_gg, FIFOBuffer);
+
+      taskENTER_CRITICAL();
+      gravity = local_gravity;
+      gg = local_gg;
+      taskEXIT_CRITICAL();
 
       x = int(ypr[2] * 64.0 / 3.14159);
       y = int(ypr[1] * 64.0 / 3.14159);
     }
+
+    vTaskDelay(pdMS_TO_TICKS(6));
   }
 }
 
@@ -436,9 +527,20 @@ static void Model(void *arg)
   {
     uint32_t t1 = micros();
 
+    // const float a[2] = {2.0f, 3.0f};
+    // CAN_SendTest(a);
+
     CAN_SendActions(actions);
     vTaskDelay(pdMS_TO_TICKS(2));
     CAN_Poll();
+
+    // Serial.println()
+    // for (int i = 0; i < 8; i++)
+    // {
+    //   Serial_.print(joint_pos[i]);
+    //   Serial_.print(", ");
+    // }
+    // Serial_.println();
 
     time_ref = fmodf(millis() * 0.003f, 1.0f); // 3 Hz gait
 
@@ -551,8 +653,6 @@ static void Model(void *arg)
     {
       actions[i] = output[0][i];
     }
-
-    // Serial_.println(remaining_time);
 
     vTaskDelay(pdMS_TO_TICKS(remaining_time / 1000));
   }
