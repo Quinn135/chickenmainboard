@@ -214,7 +214,8 @@ static void MX_FDCAN1_Init(void)
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_NO_BRS;
-  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  // hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
   hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
@@ -251,8 +252,8 @@ static void MX_FDCAN1_Init(void)
   f.FilterIndex = 0;
   f.FilterType = FDCAN_FILTER_MASK;
   f.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-  f.FilterID1 = 0x200; // ID
-  f.FilterID2 = 0x700; // mask: top 3 bits must match
+  f.FilterID1 = CAN_ID_FB_BASE; // ID
+  f.FilterID2 = 0x700;          // mask: top 3 bits must match
   HAL_FDCAN_ConfigFilter(&hfdcan1, &f);
   HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
                                FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
@@ -314,12 +315,18 @@ static void CAN_Poll()
     uint32_t ident = rx.Identifier;
     uint32_t idx = rx.Identifier - CAN_ID_FB_BASE;
 
+    // Serial.print(idx);
+    // Serial.print("-");
+    // Serial.print(rx.DataLength);
+    // Serial.print(", ");
+
     if (idx < 8)
     {
       memcpy(&joint_pos[idx], &buf[0], 4);
       memcpy(&joint_vels[idx], &buf[4], 4);
     }
   }
+  Serial.println();
 }
 
 void setup()
@@ -520,7 +527,7 @@ static void SensorRead(void *arg)
 //   {
 //   }
 // }
-
+long long last_millis = millis();
 static void Model(void *arg)
 {
   while (true)
@@ -534,13 +541,16 @@ static void Model(void *arg)
     vTaskDelay(pdMS_TO_TICKS(2));
     CAN_Poll();
 
-    // Serial.println()
-    // for (int i = 0; i < 8; i++)
-    // {
-    //   Serial_.print(joint_pos[i]);
-    //   Serial_.print(", ");
-    // }
-    // Serial_.println();
+    if (millis() - last_millis > 100)
+    {
+      for (int i = 0; i < 8; i++)
+      {
+        Serial_.print(joint_pos[i]);
+        Serial_.print(", ");
+      }
+      Serial_.println();
+      last_millis = millis();
+    }
 
     time_ref = fmodf(millis() * 0.003f, 1.0f); // 3 Hz gait
 

@@ -1,203 +1,55 @@
-# CAN and CAN FD on the mainboard
+# CAN and CAN FD
 
-A working lesson. Every section is tied to a line in `src/main.cpp`, a wire on
-the board, or a number you have to compute. Read it in order the first time.
+A working lesson in three parts.
 
-Contents:
+**Part I** teaches the protocol on its own terms. No project in it — just how a
+CAN bus works, why it was built that way, and the arithmetic you have to be
+able to redo. Worked examples use whatever numbers make the point clearest.
 
-0. What your code actually says
-1. The wire
-2. Arbitration
-3. Bit timing
-4. Oscillator tolerance
-5. CAN FD
-6. Filters, FIFOs and message RAM
-7. Errors
-8. Four questions
-9. Exercises
-10. The change list
+**Part II** comes back to this repository and maps the firmware onto Part I at
+the level of "which function does what, and why it is shaped like that". It is
+deliberately not a line-by-line audit.
+
+**Part III** is exercises with answers.
+
+Read Part I in order the first time. Part II assumes it.
 
 
-## 0. What your code actually says
+# Part I — How CAN works
 
-Before anything else: three of the numbers you gave me do not match
-`src/main.cpp`. The lesson uses the code, not the description, because the code
-is what the silicon will run.
+## 1. The bus
 
-| | You said | `src/main.cpp` |
-|---|---|---|
-| `Init.Mode` | `FDCAN_MODE_INTERNAL_LOOPBACK` | `FDCAN_MODE_NORMAL` |
-| `Init.NominalTimeSeg1` | 7 | 12 |
-| FDCAN kernel clock | 50 MHz | 75 MHz, if HSE is 25 MHz |
-| tq per bit | 10 | 15 |
-| Sample point | 80.0% | 86.7% |
+### 1.1 One differential pair, no clock, no master
 
-`PINOUT.md` agrees with your description, so it is stale too.
+A CAN bus is two wires, CANH and CANL, shared by every node. There is no clock
+line, no chip select, no master, and no arbiter. Every node is a peer, every
+node hears everything, and the wire itself resolves who gets to talk.
 
-The kernel clock is the one you must confirm on hardware rather than take from
-me. Here is the reasoning and then the measurement.
+A bit is carried as a voltage *difference* between the two wires, not as either
+wire against ground. Two states exist:
 
-`HAL_FDCAN_MspInit()` sets PLL2 to `M=2, N=12, Q=2, FRACN=0`. On the H7 the PLL
-input source is shared: `RCC_PLLCKSELR.PLLSRC` feeds PLL1, PLL2 and PLL3 alike.
-Only the `DIVMx` dividers are per-PLL. So PLL2's input is whatever
-`SystemClock_Config()` selected for PLL1.
+- **Recessive**, differential near 0 V, logical **1**. Nobody is driving.
+- **Dominant**, differential around 2 V, logical **0**. Somebody is driving.
 
-`src/main.cpp` defines `extern "C" void SystemClock_Config(void)` and selects
-`RCC_PLLSOURCE_HSE`. The Arduino core's own `SystemClock_Config()` in
-`generic_clock.c` is declared `WEAK`, and a strong definition in a directly
-linked object file wins over a weak one in a library archive. `setup()` then
-calls it explicitly on its first line as well. So HSE is the PLL source, and
-`PINOUT.md`'s claim that the board runs on HSI is out of date.
+Receivers threshold on the difference. That buys three things a single-ended
+line does not have:
 
-With HSE at 25 MHz:
-
-```
-  PLL2 input  = 25 MHz / M2  = 12.5 MHz     (RCC_PLL2VCIRANGE_3 is 8-16 MHz, ok)
-  PLL2 VCO    = 12.5 x N12   = 150 MHz      (RCC_PLL2VCOMEDIUM is 150-420 MHz, ok,
-                                             and exactly on the lower edge)
-  fdcan_ker_ck = 150 MHz / Q2 = 75 MHz
-```
-
-25 MHz is the only HSE value that makes those three constraints work at once.
-At 8 MHz the PLL2 input would be 4 MHz, below the declared VCI range, and the
-VCO would be 48 MHz, below the declared VCO range. The same 25 MHz produces a
-legal PLL1 too: 12.5 MHz in, VCO 800 MHz, P2 gives SYSCLK 400 MHz, AHB /2 gives
-HCLK 200 MHz, which is what `FLASH_LATENCY_2` at `VOS1` is rated for.
-
-Do not trust that chain. Measure it. Put this in `setup()` right after
-`Serial_.begin()` and read the number off the console:
-
-```c
-static void print_kv(const char *k, uint32_t v)
-{
-  Serial_.print(k);
-  Serial_.print(" = ");
-  Serial_.println(v);
-}
-
-static void ReportClocks(void)
-{
-  print_kv("SYSCLK          ", HAL_RCC_GetSysClockFreq());
-  print_kv("HCLK            ", HAL_RCC_GetHCLKFreq());
-  print_kv("fdcan_ker_ck    ", HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN));
-  print_kv("PLL source (0=HSI 1=CSI 2=HSE)",
-           (RCC->PLLCKSELR & RCC_PLLCKSELR_PLLSRC) >> RCC_PLLCKSELR_PLLSRC_Pos);
-}
-```
-
-Call it after `MX_FDCAN1_Init()`, because PLL2 does not exist until
-`HAL_FDCAN_MspInit()` has run. Everything in sections 3 and 4 depends on that
-one number. If it prints 50000000 rather than 75000000, your bus is running at
-667 kbit/s and not 1 Mbit/s, and none of your ESCs will talk to you.
-
-There is a second thing worth knowing before you go further. Your board does
-not exist yet as a bus. `Init.Mode` is already `FDCAN_MODE_NORMAL`, so the very
-next time you flash, the peripheral will start driving PH13 for real. Section 8
-walks through exactly what happens.
-
-
-## 1. The wire
-
-### 1.1 Why a differential pair
-
-A CAN bus carries one bit at a time as a voltage *difference* between two
-wires, CANH and CANL. There is no clock line and no separate data line. Two
-states exist:
-
-```
-  V
- 3.5 |                    +---------------+
-     |                    |     CANH      |
- 2.5 |--------------------+               +-----------------
-     |                    |     CANL      |
- 1.5 |                    +---------------+
-     +----------------------------------------------------> t
-
-        recessive              dominant           recessive
-        Vdiff ~ 0 V            Vdiff ~ 2 V        Vdiff ~ 0 V
-        logical 1              logical 0          logical 1
-```
-
-Receivers threshold on the *difference*, not on either wire against ground.
-That buys three things a single-ended line does not have:
-
-- Noise from a motor coil couples into CANH and CANL almost equally. It moves
-  both wires and leaves the difference alone. On a walking robot with eight
-  ESCs switching current, this is not a nicety.
+- Noise couples into CANH and CANL almost equally, moving both wires and
+  leaving the difference alone. Near switching motor currents this is not a
+  nicety.
 - There is no shared ground reference to get wrong. CAN receivers tolerate a
-  wide common-mode range, typically -12 V to +12 V, so the mainboard ground and
-  an ESC ground can sit volts apart and the link still works.
-- Emissions from the pair largely cancel, because the two currents are equal
-  and opposite.
+  wide common-mode range, typically -12 V to +12 V, so two nodes' grounds can
+  sit volts apart and the link still works.
+- Emissions largely cancel, because the two currents are equal and opposite.
 
-Twist the pair. The cancellation depends on the two wires seeing the same
-field, which is what twisting enforces.
+Twist the pair. The cancellation depends on both wires seeing the same field,
+which is what twisting enforces.
 
-### 1.2 What the transceiver actually does
+### 1.2 Dominant and recessive: the wired-AND
 
-Four functions, all of which the MCU pin cannot do:
-
-1. **Single-ended to differential, one direction each.** TXD in, CANH/CANL out.
-   CANH/CANL in, RXD out. Your PH13 is TXD and PI9 is RXD.
-2. **Open-drain behaviour on the bus.** For recessive, the transceiver's output
-   drivers are *off*. The bus floats to its own idle level, set by the
-   termination resistors and the receivers' bias. For dominant, it actively
-   drives CANH high and CANL low. This asymmetry is the whole trick. See 1.4.
-3. **Level translation and protection.** 5 V bus levels from a 3.3 V MCU;
-   bus-pin ESD and short-circuit protection; thermal shutdown.
-4. **Bit-rate-grade timing.** A CAN FD transceiver is specified for the loop
-   delay you are allowed to have, which section 3 turns into a number you must
-   satisfy.
-
-For your board you want a 3.3 V-IO part, which for the TJA1051 family means the
-`/3` suffix: `TJA1051T/3`. It has a `VIO` pin you tie to 3V3 while `VCC` is 5 V,
-so RXD comes back at 3.3 V levels. Its loop delay is specified 40 ns min, 250 ns
-max, and it is rated for CAN FD data phases up to 5 Mbit/s. Hold onto 250 ns;
-section 3 spends it.
-
-Also check the `S` / `STB` pin. On a TJA1051 it must be pulled **low** for
-normal mode. Left floating or high, the transmitter is disabled and the part
-only listens. That single unpopulated pulldown resistor is one of the two most
-common reasons a first CAN board does not work, and it produces the *bad*
-failure mode in section 8.1.
-
-### 1.3 Why PI9 and PH13 are not the bus
-
-They carry the same bits, but as ordinary 3.3 V push-pull CMOS logic referenced
-to the mainboard ground. Specifically:
-
-- PH13 is push-pull. It drives *both* levels hard. A CAN bus needs one level
-  driven and one released, or wired-AND cannot work (1.4).
-- A GPIO cannot source the current a terminated bus draws. Two 120 ohm
-  resistors in parallel is 60 ohm; a dominant bit pulls roughly 2 V across it,
-  about 33 mA of differential current. That is outside what an H7 pin should be
-  asked to do, and the pin has no common-mode range at all.
-- No fault protection. A shorted bus would take the pin, and probably the port,
-  with it.
-
-Note the polarity in `HAL_FDCAN_MspInit()`. Both pins are `GPIO_MODE_AF_PP`
-with `GPIO_AF9_FDCAN1`, which is correct, but:
-
-```c
-GPIO_InitStruct.Pin = GPIO_PIN_9;      // PI9, FDCAN1_RX
-GPIO_InitStruct.Pull = GPIO_NOPULL;    // <-- change this
-```
-
-With no transceiver fitted, or with one that is unpowered, PI9 floats. The
-FDCAN receiver samples a floating pin as noise, and will report stuff and form
-errors for signals that were never on any wire. Set `GPIO_PULLUP` on the RX pin
-so an absent transceiver reads as a permanently recessive, permanently idle
-bus. Leave TX as `GPIO_NOPULL`; the transceiver has its own TXD pull-up so that
-a resetting MCU, whose pins revert to floating inputs, cannot hold the bus
-dominant.
-
-`GPIO_SPEED_FREQ_LOW` is fine at 1 Mbit/s, where a bit is 1000 ns and you need
-edges in the tens of nanoseconds. Revisit it if you ever enable BRS.
-
-### 1.4 Dominant, recessive, and why there is no master
-
-The bus is a wired-AND. If any node drives dominant, the bus is dominant.
-Recessive only happens when *every* node has released.
+This is the single most important idea in CAN, and everything else falls out of
+it. The bus is a **wired-AND**. If any node drives dominant, the bus is
+dominant. Recessive happens only when *every* node has released.
 
 ```
   node A   1   1   0   1
@@ -207,115 +59,177 @@ Recessive only happens when *every* node has released.
   bus      1   0   0   0
 ```
 
-Two consequences, and they carry the entire protocol:
+The asymmetry is deliberate: dominant is actively driven, recessive is merely
+released. A node cannot force the bus recessive, only dominant.
 
-**Every transmitter also receives.** While a node transmits, it samples the bus
-at the sample point of every bit and compares it against what it meant to send.
-If it sent recessive and read dominant, another node overrode it. If it sent
-dominant and read recessive, something is broken (that is a bit error;
-section 7).
+Two consequences carry the entire protocol.
 
-**Losing is free.** During the identifier field, a node that sent recessive and
-read dominant simply stops transmitting and switches to receiving the frame
-that beat it. It did not corrupt anything. The winner never noticed. The loser
-still gets the message. Nothing was retransmitted, no slot was wasted, and no
-central node decided anything. That is why CAN needs no master and no
-scheduler, and it is why the bus is deterministic under load: the highest
-priority message pending anywhere on the bus is always the one being sent.
+**Every transmitter also receives.** While transmitting, a node samples the bus
+on every bit and compares it against what it meant to send. If it sent
+recessive and read dominant, someone else overrode it. If it sent dominant and
+read recessive, something is broken.
+
+**Losing costs nothing.** During the identifier field, a node that sent
+recessive and read dominant simply stops transmitting and starts receiving the
+frame that beat it. It corrupted nothing. The winner never noticed. The loser
+still gets the message, and can retry when the bus goes idle. No slot was
+wasted and no central node decided anything.
+
+That is why CAN needs no master and no scheduler, and why it stays
+deterministic under load: the highest-priority message pending anywhere on the
+bus is always the one being sent.
+
+### 1.3 What a transceiver does
+
+Between the controller's two logic pins and the differential pair sits a
+transceiver. It does four things, none of which an MCU pin can:
+
+1. **Single-ended to differential, one direction each.** TXD in, CANH/CANL out;
+   CANH/CANL in, RXD out.
+2. **Open-drain behaviour on the bus.** For recessive, the output drivers are
+   *off* and the bus floats to its idle level, set by the termination and the
+   receivers' bias. For dominant, it actively drives CANH high and CANL low.
+   This is what makes the wired-AND of 1.2 physically real.
+3. **Level translation and protection.** 5 V bus levels from a 3.3 V MCU, plus
+   ESD, short-circuit and thermal protection on the bus pins.
+4. **Bit-rate-grade timing.** A transceiver is specified for a maximum **loop
+   delay** — TXD edge in to RXD edge out, through the bus and back. Section 3.3
+   turns that number into a constraint you must satisfy.
+
+Two practical notes that cost people days.
+
+Most transceivers have a **standby / silent pin** (`S`, `STB`, or similar) that
+must be asserted to the active level — usually pulled **low** — for the part to
+transmit. Left floating, many parts come up listen-only: the controller
+transmits, nothing reaches the wire, and software sees no error it recognises.
+A missing pulldown resistor is one of the two most common reasons a first CAN
+board does not work.
+
+If the MCU is 3.3 V, you want a transceiver with a separate `VIO` supply pin
+(on the common TJA1051 family this is the `/3` suffix) so RXD comes back at
+3.3 V levels rather than 5 V.
+
+### 1.4 Why an MCU pin is not a bus
+
+The controller's TX and RX pins carry the same bits, but as ordinary
+push-pull CMOS logic referenced to local ground:
+
+- A push-pull output drives *both* levels hard. A CAN bus needs one level driven
+  and one released, or the wired-AND cannot work at all.
+- A GPIO cannot source the current a terminated bus draws. Two 120 ohm
+  terminators in parallel is 60 ohm, and a 2 V dominant differential across
+  that is about 33 mA — outside what a typical MCU pin should be asked to do.
+- There is no fault protection and no common-mode range. A shorted bus takes
+  the pin, and probably the port, with it.
+
+One configuration detail worth knowing now: it is worth putting a **pull-up on
+the RX pin**. If the transceiver is absent or unpowered, RX floats, and a
+floating input is sampled as noise — the controller will report stuff and form
+errors for signals that were never on any wire. A pull-up makes an absent
+transceiver read as a permanently idle, permanently recessive bus, which is a
+much more honest thing to debug. Leave TX without a pull; the transceiver has
+its own TXD pull-up, so that an MCU in reset, whose pins revert to floating
+inputs, cannot hold the bus dominant.
 
 
 ## 2. Arbitration
 
-### 2.1 The mechanism, on your IDs
+### 2.1 How priority falls out of the wired-AND
 
-Arbitration happens over the 11 identifier bits, most significant first
-(ID10 down to ID0). Lower numeric ID means more dominant bits early, means
-higher priority.
+Arbitration happens over the identifier field, most significant bit first. For
+a standard frame that is 11 bits, ID10 down to ID0.
 
-Your three cases, with 0x100 = mainboard command, 0x200 = ESC 0 feedback,
-0x207 = ESC 7 feedback:
+Every node that wants to transmit starts at the same time — when the bus goes
+idle — and sends its identifier. On each bit, a node that sends recessive and
+reads dominant has just been outbid, so it stops and receives instead.
+
+The result: **the numerically lowest identifier wins**, and it wins at the most
+significant bit where the identifiers differ. Low ID means more dominant bits
+early means higher priority.
+
+Three nodes with identifiers 0x100, 0x200 and 0x207 starting together:
 
 ```
                   ID10 ID9 ID8 ID7 ID6 ID5 ID4 ID3 ID2 ID1 ID0
-  0x100 mainboard    0   0   1   0   0   0   0   0   0   0   0
-  0x200 ESC 0        0   1   0   0   0   0   0   0   0   0   0
-  0x207 ESC 7        0   1   0   0   0   0   0   0   1   1   1
+  0x100              0   0   1   0   0   0   0   0   0   0   0
+  0x200              0   1   0   0   0   0   0   0   0   0   0
+  0x207              0   1   0   0   0   0   0   0   1   1   1
   ----------------------------------------------------------------
   bus                0   0   1   0   0   0   0   0   0   0   0
                          ^
-                         both ESCs send recessive here and read
-                         dominant. They lose, stop, and receive.
+                         0x200 and 0x207 send recessive and read
+                         dominant. Both lose here, on the same bit.
 ```
 
-If all three start in the same bit time, the mainboard wins on ID9 and both
-ESCs back off after ten bit times, having transmitted nothing but a SOF and one
-identifier bit. Once the command frame ends and the bus goes idle, ESC 0 and
-ESC 7 both start again. Now:
+0x100 wins on ID9 and the other two back off, having transmitted nothing but a
+start bit and one identifier bit. When the bus next goes idle they both start
+again, and now:
 
 ```
                   ID10 ID9 ID8 ID7 ID6 ID5 ID4 ID3 ID2 ID1 ID0
-  0x200 ESC 0        0   1   0   0   0   0   0   0   0   0   0
-  0x207 ESC 7        0   1   0   0   0   0   0   0   1   1   1
+  0x200              0   1   0   0   0   0   0   0   0   0   0
+  0x207              0   1   0   0   0   0   0   0   1   1   1
                                                      ^
-                                                     ESC 7 loses at ID2
+                                                     0x207 loses at ID2
 ```
 
-The eight replies serialise themselves in ID order, deterministically, with no
-collision and no retry. ESC 0 goes first, ESC 7 last. At 1 Mbit/s with 8-byte
-classic feedback frames, ESC 7 starts its frame about 7 x 111 = 777 us after
-ESC 0 started. Remember that number for section 8.
+A set of replies serialises itself in identifier order, deterministically, with
+no collisions and no retries. Nothing coordinated that.
 
-### 2.2 Was your numbering a good choice
+### 2.2 Designing an identifier scheme
 
-Mostly yes. Three observations.
+Identifiers are a priority space, so lay them out on purpose.
 
-**Commands above feedback is correct.** Command is 0x100, feedback is 0x2xx, so
-commands preempt feedback. Your control loop sends a command and then waits for
-replies to it; the command must go out first or the whole cycle slips. If you
-had numbered them the other way, a burst of eight feedback frames would sit in
-front of every command.
+**Put control above telemetry.** If a controller sends commands and devices
+send feedback, commands should have the lower identifiers. Otherwise a burst of
+feedback frames sits in front of every command and the control loop slips.
 
-**One broadcast beats eight unicasts.** Your 32-byte frame carrying all eight
-joint targets costs one arbitration and one set of frame overhead: 316 bit
-times on the wire, of which 256 are payload. Eight separate 4-byte classic
-frames would cost 8 x 79 = 632 bit times to carry the same 256 bits. Twice the
-wire time for the same data. The cost of broadcasting is that a single
-corrupted command frame misses all eight joints for a cycle, but CAN
-retransmits automatically on error and your bus load is 6%, so this is the
-right trade.
+**Leave the top of the space free for safety traffic.** An emergency stop that
+cannot preempt a routine command is not an emergency stop. Reserving the lowest
+block for faults and e-stop costs nothing up front and cannot be retrofitted
+cheaply.
 
-**You have left the right space free.** 0x000 to 0x0FF is empty and sits above
-your commands. Put a fault or emergency-stop broadcast there. An e-stop that
-cannot preempt a joint command is not an e-stop:
-
-```c
-static const uint32_t CAN_ID_ESTOP   = 0x000;  // beats everything
-static const uint32_t CAN_ID_FAULT   = 0x010;  // ESC reports a fault
-static const uint32_t CAN_ID_CMD     = 0x100;  // you have this
-static const uint32_t CAN_ID_FB_BASE = 0x200;  // you have this
-static const uint32_t CAN_ID_CFG     = 0x300;  // per-ESC config, 0x300 + n
+```
+  0x000 - 0x0FF   emergency stop, faults        (beats everything)
+  0x100 - 0x1FF   commands
+  0x200 - 0x2FF   feedback / telemetry
+  0x300 - 0x3FF   configuration
 ```
 
-Two rules to respect while you are in there. The seven most significant bits of
-a standard identifier must not all be recessive, which makes 0x7F0 to 0x7FF
-unusable. And no two nodes may ever transmit different content under the same
-identifier: two nodes starting the same ID in the same bit time will tie all
-the way through arbitration and then destroy each other's frames at the first
-differing data bit. Your scheme has one transmitter per ID, which is the rule.
+**One broadcast usually beats many unicasts.** One frame carrying eight values
+costs a single arbitration and a single set of frame overhead. Eight small
+frames pay that overhead eight times, and can easily cost twice the wire time
+for the same payload. The trade is that one corrupted broadcast misses all
+recipients for a cycle — but CAN retransmits automatically on error, so if bus
+load is low this is usually the right call.
+
+Two hard rules:
+
+- The seven most significant bits of a standard identifier must not all be
+  recessive, which makes 0x7F0 to 0x7FF unusable.
+- **Exactly one transmitter per identifier.** Two nodes sending different
+  content under the same ID tie all the way through arbitration, neither
+  realises it lost, and then they destroy each other at the first differing
+  data bit — outside the arbitration field, so it counts as a bit error rather
+  than a lost arbitration. Both retransmit and collide again.
 
 
 ## 3. Bit timing
 
-### 3.1 Time quanta
+### 3.1 Time quanta and the four segments
 
-Everything is built from one unit. The FDCAN peripheral divides its kernel
-clock by `NominalPrescaler` to get a time quantum:
+There is no clock line, so every node reconstructs bit boundaries from its own
+oscillator plus the edges in the data. Getting every node to agree on where a
+bit starts and when to sample it is what bit timing configuration is for.
+
+Everything is built from one unit. The controller divides its kernel clock by a
+prescaler to get a **time quantum**:
 
 ```
-  t_q = NominalPrescaler / fdcan_ker_ck
+  t_q = prescaler / f_kernel
 ```
 
-A bit is an integer number of time quanta, split into three segments:
+A bit is an integer number of time quanta, split into segments:
 
 ```
 |<------------------- 1 bit time = N_tq time quanta ------------------>|
@@ -324,150 +238,148 @@ A bit is an integer number of time quanta, split into three segments:
 | 1 tq |                                                      |
 +------+----------------------------------------------------+----------+
        ^                                                     ^
-       a recessive-to-dominant edge is expected here     sample point
-       (this is what synchronisation aligns)             the bit is read here
+       an edge is expected here                         sample point
 ```
 
 - **SYNC_SEG** is always exactly 1 tq. Edges are supposed to fall inside it.
-- **Prop_Seg** exists to absorb signal propagation. It must be long enough that
-  a bit driven by the far end of the bus has arrived, been converted back to
-  logic, and settled, before we sample. Section 3.4 sizes it.
+- **Prop_Seg** absorbs signal propagation. It must be long enough that a bit
+  driven by the far end of the bus has arrived and settled before sampling.
 - **Phase_Seg1** and **Phase_Seg2** straddle the sample point and are the parts
-  that get stretched and shortened during resynchronisation.
+  that get stretched or shortened during resynchronisation.
 - **The sample point** is the boundary between Phase_Seg1 and Phase_Seg2. Every
-  node on the bus reads the bit value at this instant.
+  node reads the bit value at this instant.
 
-The ST HAL does not expose Prop_Seg separately. `NominalTimeSeg1` is
-`Prop_Seg + Phase_Seg1` lumped together, and `NominalTimeSeg2` is Phase_Seg2.
-So:
-
-```
-  N_tq         = 1 + NominalTimeSeg1 + NominalTimeSeg2
-  bit rate     = fdcan_ker_ck / (NominalPrescaler * N_tq)
-  sample point = (1 + NominalTimeSeg1) / N_tq
-```
-
-Hardware stores `NTSEG1 - 1` and `NTSEG2 - 1` in `FDCAN_NBTP` and adds the one
-back. You give the HAL the true segment lengths, not the register values.
-
-### 3.2 The 50 MHz numbers you described
+Most controller APIs, including ST's, do not expose Prop_Seg separately.
+`TimeSeg1` is `Prop_Seg + Phase_Seg1` lumped together and `TimeSeg2` is
+Phase_Seg2. So:
 
 ```
-  fdcan_ker_ck   = 50 MHz
-  NominalPrescaler = 5      -> t_q = 5 / 50e6 = 100 ns
-  N_tq needed for 1 Mbit/s: bit time 1000 ns / 100 ns = 10 tq
-  1 + Seg1 + Seg2 = 10      -> Seg1 + Seg2 = 9
-  want 80% sample point:  (1 + Seg1) / 10 = 0.80  ->  Seg1 = 7, Seg2 = 2
-  check: 50e6 / (5 * 10) = 1 000 000 bit/s exactly, SP = 8/10 = 80.0%
+  N_tq         = 1 + TimeSeg1 + TimeSeg2
+  bit rate     = f_kernel / (prescaler * N_tq)
+  sample point = (1 + TimeSeg1) / N_tq
 ```
 
-That is the derivation. Four steps: prescaler picks t_q, bit rate picks N_tq,
-sample point splits N_tq, then check the division comes out exact.
+Registers typically store these values minus one and add the one back in
+hardware. Give the driver the true segment lengths, not the register values.
 
-### 3.3 The numbers actually in your code
+### 3.2 Deriving a configuration
+
+Four steps. Take a 40 MHz kernel clock and a target of 500 kbit/s at an 80%
+sample point.
+
+**Step 1 — the bit rate equation has one unknown product.**
 
 ```
-  fdcan_ker_ck     = 75 MHz     (assuming HSE = 25 MHz, section 0)
-  NominalPrescaler = 5          -> t_q = 5 / 75e6 = 66.67 ns
-  NominalTimeSeg1  = 12
-  NominalTimeSeg2  = 2
-  N_tq = 1 + 12 + 2 = 15
-  bit rate = 75e6 / (5 * 15) = 1 000 000 bit/s exactly
-  sample point = 13 / 15 = 86.67%
-  SJW = 2
+  prescaler * N_tq = f_kernel / bit_rate = 40e6 / 500e3 = 80
 ```
 
-So the bit rate is right and the sample point moved from 80% to 86.7%. Whoever
-retimed this for 75 MHz kept `Seg2 = 2` and put all the extra tq into `Seg1`,
-which is the lazy split. Section 3.5 and section 4 show what it costs and what
-it buys, and it is not one-sided.
+**Step 2 — factor it, and discard the unusable.** Both segments have a minimum
+of 2 tq in most controllers, so N_tq below about 5 cannot express a sensible
+sample point.
 
-Note the trap: if the kernel clock is *not* 75 MHz and is still 50 MHz, the
-same register values give `50e6 / (5 * 15) = 666.7 kbit/s`. Nothing in software
-will tell you. This is exactly why section 0 makes you print the clock.
+```
+  prescaler 1,  N_tq 80   t_q = 25 ns    usable, finest resolution
+  prescaler 2,  N_tq 40   t_q = 50 ns    usable
+  prescaler 4,  N_tq 20   t_q = 100 ns   usable
+  prescaler 8,  N_tq 10   t_q = 200 ns   usable, coarse
+  prescaler 16, N_tq 5    t_q = 400 ns   best sample point is 3/5 = 60%
+```
 
-### 3.4 Sizing Prop_Seg, which is where the transceiver bill arrives
+**Step 3 — split N_tq for the sample point.** You want
+`1 + TimeSeg1 = SP * N_tq`. Taking N_tq = 20:
 
-Prop_Seg must cover the round trip: your transceiver drives the bus, the signal
-crosses the cable, the far transceiver converts it to logic, that node responds
-dominant, and its dominant bit has to get all the way back and settle at your
-receiver before your sample point.
+```
+  1 + TimeSeg1 = 0.80 * 20 = 16   ->   TimeSeg1 = 15, TimeSeg2 = 4
+  SJW = TimeSeg2 = 4
+```
+
+**Step 4 — check the division came out exact.**
+
+```
+  40e6 / (4 * 20) = 500 000 bit/s     exact
+  (1 + 15) / 20   = 0.80              exact
+```
+
+If it does not come out exact, the bit rate is wrong and no amount of software
+will tell you. Which brings us to the trap worth internalising now: **the same
+register values with a different kernel clock give a different bit rate,
+silently.** If a configuration derived for 50 MHz is left in place when the
+clock becomes 75 MHz, the bus runs at 1.5x the intended rate and nothing in
+software reports it. Always confirm the kernel clock is what you think it is.
+
+### 3.3 The sample point pays for propagation delay
+
+Prop_Seg must cover a full round trip: the local transceiver drives the bus,
+the signal crosses the cable, the far transceiver converts it to logic, that
+node responds dominant, and its dominant bit gets all the way back and settles
+before the local sample point.
 
 ```
   Prop_Seg  >=  2 x (transceiver loop delay + cable delay)
 ```
 
-Copper is about 5 ns per metre. With `Seg1 = 12` and `Seg2 = 2` at 66.67 ns per
-tq, Seg1 is 800 ns. Keep at least `Phase_Seg1 >= Phase_Seg2 = 2 tq` so that
-`min(PhSeg1, PhSeg2)` in section 4 stays equal to Phase_Seg2, and:
+Copper is about 5 ns per metre. Suppose a bit is 15 tq of 66.67 ns, with
+TimeSeg1 = 12 and TimeSeg2 = 2. Keeping `Phase_Seg1 >= Phase_Seg2` so that
+section 4's `min(PhSeg1, PhSeg2)` stays equal to Phase_Seg2:
 
 ```
   Prop_Seg <= 12 - 2 = 10 tq = 667 ns
   transceiver loop + cable <= 333 ns
-  on a 2 m robot (10 ns of cable): loop delay budget = 323 ns
+  over 2 m of cable (10 ns): loop delay budget = 323 ns
 ```
 
-A TJA1051T/3 at its 250 ns worst case fits with 73 ns to spare. Now redo it for
-an 80% sample point, `Seg1 = 11`, `Seg2 = 3`:
+Now move the sample point earlier to 80%, TimeSeg1 = 11 and TimeSeg2 = 3:
 
 ```
   Prop_Seg <= 11 - 3 = 8 tq = 533 ns
   transceiver loop + cable <= 267 ns
-  on a 2 m robot: loop delay budget = 257 ns
+  over 2 m: loop delay budget = 257 ns
 ```
 
-The same transceiver fits with 7 ns to spare. That is not margin, that is luck.
+A transceiver specified at 250 ns worst case fits the first with 73 ns to
+spare and the second with 7 ns. Seven nanoseconds is not margin, it is luck.
 
-So the 86.7% sample point in your code is defensible: it buys propagation
-budget. It is not free, and section 4 is where the bill lands.
+So a later sample point buys propagation budget. Section 4 is where the bill
+arrives.
 
-### 3.5 SJW and resynchronisation
+### 3.4 Synchronisation and the jump width
 
-There is no clock line. Every receiver runs its own bit-time counter off its
-own oscillator, and the only thing keeping the counters aligned is the edges in
-the data.
+Every receiver runs its own bit-time counter off its own oscillator. Two
+mechanisms keep those counters aligned:
 
-Two mechanisms:
-
-- **Hard synchronisation** happens once per frame, on the falling edge of SOF.
-  The receiver restarts its bit-time counter so that edge lands in SYNC_SEG.
+- **Hard synchronisation** happens once per frame, on the falling edge that
+  starts it. The receiver restarts its counter so that edge lands in SYNC_SEG.
 - **Resynchronisation** happens on every subsequent recessive-to-dominant edge.
-  If the edge arrives *late* (the receiver is running fast), Phase_Seg1 is
-  lengthened. If it arrives *early* (the receiver is running slow), Phase_Seg2
-  is shortened. Either way the sample point is pushed back toward the middle of
-  the incoming bit.
+  An edge arriving *late* (receiver running fast) lengthens Phase_Seg1; an edge
+  arriving *early* (receiver running slow) shortens Phase_Seg2. Either way the
+  sample point is pushed back toward the middle of the incoming bit.
 
-`NominalSyncJumpWidth` is the cap on how much one edge is allowed to move
-things, in tq. Your `SJW = 2` with `t_q = 66.67 ns` means each edge can correct
-at most 133 ns of accumulated drift.
-
-Two hard rules:
+The **synchronisation jump width (SJW)** caps how much a single edge is allowed
+to move things. Two hard rules:
 
 ```
-  SJW <= Phase_Seg2                       (you cannot shorten Seg2 below zero)
-  SJW <= Phase_Seg1                       (same, the other way)
+  SJW <= Phase_Seg1        and        SJW <= Phase_Seg2
 ```
 
-so in practice `SJW <= min(Phase_Seg1, Phase_Seg2)`, and since Phase_Seg2 is
-almost always the smaller one, `SJW = Phase_Seg2` is the standard choice. Yours
-satisfies this: `SJW = 2 = Seg2`.
+Phase_Seg2 is almost always the smaller, so `SJW = TimeSeg2` is the standard
+choice, and the one to use unless you have a reason not to.
 
-Bit stuffing is what guarantees edges exist at all. After five consecutive bits
-of the same value, the transmitter inserts one bit of the opposite value, which
-receivers remove. So there is a resynchronisation opportunity at least every
-ten bits. That "ten bits" is the constant that shows up in the next section's
-first formula, and the "13 bits" in the second is the worst-case span with no
-usable edge at all, during an error flag.
+**Bit stuffing** guarantees the edges exist. After five consecutive bits of the
+same value the transmitter inserts one of the opposite value, which receivers
+remove. So there is a resynchronisation opportunity at least every ten bits.
+That "ten bits" is the constant in the next section's first formula; the
+"thirteen bits" in the second is the worst-case span with no usable edge at
+all, during an error flag.
 
 
 ## 4. Oscillator tolerance
 
 ### 4.1 The two conditions
 
-Two nodes must stay aligned for a whole frame using only resynchronisation.
-That gives two constraints, both from ISO 11898-1. `df` is the fractional
-frequency error of one node relative to nominal; the factor of 2 is there
-because the two nodes can be off in opposite directions.
+Two nodes must stay aligned for a whole frame using resynchronisation alone.
+ISO 11898-1 turns that into two constraints. `df` is the fractional frequency
+error of one node relative to nominal; the factor of two is there because two
+nodes can be off in opposite directions.
 
 ```
   (1)  df  <=  SJW / (2 * 10 * N_tq)
@@ -476,52 +388,29 @@ because the two nodes can be off in opposite directions.
 ```
 
 Condition (1) is the resynchronisation budget: over the ten bits between
-guaranteed edges, the drift accumulated by two nodes must be recoverable by one
-SJW correction.
+guaranteed edges, the drift two nodes accumulate must be recoverable by one SJW
+correction.
 
-Condition (2) is the no-edge case: during an error flag there can be 13 bit
-times with no usable resynchronisation, and the drift over that span must not
-push the sample point out of the bit.
+Condition (2) is the no-edge case: during an error flag there can be thirteen
+bit times with no usable resynchronisation, and the drift over that span must
+not push the sample point out of the bit.
 
-Your tolerance is the smaller of the two. Condition (2) is almost always the
-binding one.
+Your tolerance is the smaller of the two. **Condition (2) is almost always the
+binding one.**
 
-### 4.2 Your numbers
+### 4.2 Tolerance follows the sample point
 
-Both configurations, with `PhSeg1` taken as the whole of `Seg1` (an upper
-bound; carving out Prop_Seg only makes it worse, and it does not matter here
-because `Seg2` is the smaller term either way):
-
-| config | N_tq | SJW | Seg2 | SP | cond (1) | cond (2) | df max |
-|---|---|---|---|---|---|---|---|
-| 50 MHz, p5, 7/2, SJW 2 (described) | 10 | 2 | 2 | 80.0% | 1.000% | 0.781% | **0.781%** |
-| 75 MHz, p5, 12/2, SJW 2 (your code) | 15 | 2 | 2 | 86.7% | 0.667% | 0.518% | **0.518%** |
-| 75 MHz, p5, 11/3, SJW 3 | 15 | 3 | 3 | 80.0% | 1.000% | 0.781% | **0.781%** |
-
-Worked, for the middle row:
-
-```
-  (1)  2 / (2 * 10 * 15)              = 2 / 300  = 0.00667 = 0.667%
-  (2)  min(12,2) / (2 * (13*15 - 2))  = 2 / 386  = 0.00518 = 0.518%
-  df = 0.518%  =  5181 ppm
-```
-
-Every node on the bus, including all eight ESCs, must hold its CAN clock within
-+/- 0.518% of nominal, at every temperature the robot will see. That is the
-number your current code demands.
-
-Notice the pattern in the table: the tolerance is set by the *sample point*,
-not by how many tq you use. With `SJW = Phase_Seg2`, condition (2) reduces to
+Here is the part worth remembering. With `SJW = Phase_Seg2`, condition (2)
+reduces to
 
 ```
   df = (1 - SP) / (2 * (13 - (1 - SP)))
 ```
 
-which for SP = 80% is 0.2 / 25.6 = 0.781% regardless of N_tq. Adding time
-quanta does not buy tolerance. It buys *resolution* to place the sample point
-where you want it. Here is the same 15 tq budget swept:
+which depends **only on the sample point** — not on how many time quanta you
+used. Sweeping one 15 tq budget:
 
-| Seg1 | Seg2 | SJW | sample point | df max |
+| TimeSeg1 | TimeSeg2 | SJW | sample point | max df |
 |---|---|---|---|---|
 | 13 | 1 | 1 | 93.3% | 0.258% |
 | 12 | 2 | 2 | 86.7% | 0.518% |
@@ -529,119 +418,115 @@ where you want it. Here is the same 15 tq budget swept:
 | 10 | 4 | 4 | 73.3% | 1.047% |
 | 9 | 5 | 5 | 66.7% | 1.316% |
 
-This is the whole trade-off, in one table. Later sample point buys propagation
-delay (3.4) and costs oscillator tolerance. Earlier sample point does the
-reverse. 75% to 87.5% is the usual band; automotive tends to 80%.
+Worked, for the 86.7% row:
 
-### 4.3 Why this makes RC versus crystal an engineering decision
+```
+  (1)  2 / (2 * 10 * 15)              = 2 / 300  = 0.667%
+  (2)  min(12,2) / (2 * (13*15 - 2))  = 2 / 386  = 0.518%     binds
+```
 
-Put the two candidate clock sources against a 0.518% budget.
+**Adding time quanta does not buy tolerance.** An 80% sample point gives
+0.781% whether you build it from 15, 25 or 75 tq. What more time quanta buy is
+*resolution* — at 15 tq the sample point moves in 6.7% steps, at 25 tq in 4.0%
+steps, at 75 tq in 1.3% steps. That matters when a device vendor specifies a
+sample point you need to land near.
 
-**Internal RC (HSI).** The H743's HSI is factory trimmed to roughly +/- 1% at
-room temperature, and drifts to a few percent across the full operating
-temperature range. Check Table 37 in the datasheet revision you have, but the
-conclusion does not depend on the third digit: at room temperature, before
-anything gets warm, the *specified* accuracy is already about twice your
-budget. A robot's electronics bay does not stay at room temperature.
+This is the whole trade-off in one line: **later sample point buys propagation
+delay and costs oscillator tolerance; earlier does the reverse.** 75% to 87.5%
+is the usual band; automotive tends to 80%.
 
-**Crystal (HSE).** A commodity 25 MHz crystal is +/- 30 to +/- 50 ppm, which is
-0.003% to 0.005%. Add load-capacitor error and ageing and call it 100 ppm,
-0.01%. That is fifty times inside your budget.
+Note also that nodes do **not** have to agree on sample point. They must agree
+on the bit *rate*. Each node independently picks its own prescaler, tq count
+and sample point, and independently has to satisfy its own tolerance and
+propagation constraints.
 
-The gap is not marginal, it is two orders of magnitude. This is the difference
-between a bus that works and a bus that does not, and it is why every CAN
-reference tells you to use a crystal. It is also worth understanding *why* an
-RC oscillator fails in a specific, maddening way: at 25 C on the bench it will
-often work. It starts failing when the board warms up, or when one ESC is near
-a motor and another is not, and the failures look like random CRC and form
-errors rather than anything you can point at.
+### 4.3 Crystal or RC: an engineering decision
 
-Three practical consequences:
+Put two candidate clock sources against a budget of, say, 0.5%.
 
-1. If `RCC->PLLCKSELR & RCC_PLLCKSELR_PLLSRC` prints anything other than 2
-   (HSE), stop and fix the clock tree before touching the bus. Section 0's
-   snippet tells you.
-2. The budget applies to *every* node. Ask what the ESCs clock their CAN
-   controllers from. One RC-clocked ESC will corrupt frames for everybody,
-   including frames it is not part of, because its error flags are dominant
-   bits on a shared wire.
-3. Your worst case is the sum of everything: crystal initial tolerance, plus
-   temperature drift, plus ageing, plus load capacitance mismatch. Budget the
-   whole stack against 0.518%, not just the datasheet's initial accuracy.
+**Internal RC oscillator.** A typical MCU's internal RC is factory trimmed to
+roughly +/- 1% at room temperature, drifting to several percent across the full
+operating temperature range. At room temperature, before anything gets warm,
+the *specified* accuracy is already about twice the budget.
 
-If you want the headroom back, move to `Seg1 = 11, Seg2 = 3, SJW = 3` and the
-budget widens to 0.781% at the cost of the propagation margin in 3.4. With a
-250 ns transceiver on a short robot harness that is a coin flip. With a faster
-transceiver it is free.
+**Crystal.** A commodity crystal is +/- 30 to +/- 50 ppm, which is 0.003% to
+0.005%. Add load-capacitor error and ageing and call it 100 ppm. That is fifty
+times inside the budget.
+
+The gap is not marginal, it is two orders of magnitude. This is why every CAN
+reference tells you to use a crystal, and it is worth understanding *how* an RC
+oscillator fails, because the failure is maddening rather than obvious: at 25 C
+on the bench it will often work. It starts failing when the board warms up, or
+when one node sits near a heat source and another does not, and it presents as
+random CRC and form errors rather than anything you can point at.
+
+Three consequences:
+
+1. The budget applies to **every node on the bus**, not just yours. One
+   RC-clocked node corrupts frames for everybody, including frames it has no
+   part in, because its error flags are dominant bits on a shared wire.
+2. Budget the whole stack — initial tolerance, temperature drift, ageing, load
+   capacitance mismatch — not just the datasheet's initial accuracy figure.
+3. If you are tight, moving the sample point earlier buys tolerance back at the
+   cost of propagation margin (3.3). Whether that trade is available depends on
+   your transceiver and cable length.
 
 
-## 5. CAN FD versus classic CAN
+## 5. CAN FD
 
 ### 5.1 What FD changes
 
-Three things, and you are using one of them.
+Three things:
 
-1. **Payload up to 64 bytes** instead of 8. You use 32.
-2. **Bit rate switching (BRS)**, where the data phase runs at a higher bit rate
-   than the arbitration phase. You have this off.
-3. **Stronger CRC** (17 bits for payloads up to 16 bytes, 21 bits above) and a
+1. **Payload up to 64 bytes** instead of 8.
+2. **Bit rate switching (BRS)**, where the data phase runs faster than the
+   arbitration phase.
+3. **Stronger CRC** (17 bits for payloads up to 16 bytes, 21 above) plus a
    stuff-count field, so long frames are protected properly.
 
-Frame-level differences you will see in the register fields: the RTR bit is
-gone (FD has no remote frames), the reserved bit becomes FDF to mark the frame
-as FD, and ESI appears to advertise whether the transmitter is error-passive.
+In the frame itself: the RTR bit is gone (FD has no remote frames), a reserved
+bit becomes FDF to mark the frame as FD, and ESI appears to advertise whether
+the transmitter is error-passive.
 
 ### 5.2 The compatibility trap
 
-`FrameFormat = FDCAN_FRAME_FD_NO_BRS` means your controller *transmits* FD
-frames. It will still receive classic frames happily, so if your ESCs reply in
-classic 8-byte frames that works.
+An FD controller will happily **receive** classic frames. Mixed traffic in that
+direction is fine.
 
-The reverse does not work. A classic-only CAN controller that sees your FD
-frame reads the FDF bit as a violation of the frame format, declares a form
-error, and transmits an active error flag: six dominant bits, on the shared
-wire, in the middle of your command frame. It destroys the frame for all eight
-ESCs, drives its own receive error counter up, and yours too via the
-retransmission. One classic-only node makes an FD bus unusable.
+The reverse is not. A classic-only controller that sees an FD frame reads the
+FDF bit as a frame-format violation, declares a form error, and transmits an
+active error flag — six dominant bits, on the shared wire, in the middle of
+your frame. It destroys that frame for every node, drives its own receive error
+counter up and the transmitter's too via the retransmission.
 
-So before you leave loopback: confirm all eight ESCs use CAN FD capable
-controllers. Not FD-*tolerant*, which only means they stay quiet; actually
-FD-capable. This is a datasheet check, not a code check, and it is the single
+**One classic-only node makes an FD bus unusable.** Before putting FD traffic
+on a shared bus, confirm every node is FD-*capable*, not merely FD-*tolerant*
+(which only means it stays quiet). This is a datasheet check, and it is the
 most expensive thing to discover late.
 
-### 5.3 Why 32 bytes is `FDCAN_DLC_BYTES_32` and not 32
+### 5.3 DLC is a lookup table
 
-The DLC field on the wire is four bits. Four bits is sixteen values, and CAN FD
-needs to express seventeen useful lengths. It cannot, so it does not: above 8
-bytes the encoding becomes a lookup table with gaps.
+The data length code on the wire is four bits. Four bits is sixteen values, and
+CAN FD needs seventeen useful lengths. It cannot have them, so above 8 bytes
+the encoding becomes a table with gaps:
 
 | DLC | bytes | | DLC | bytes |
 |---|---|---|---|---|
 | 0-8 | 0-8 | | 12 | 24 |
-| 9 | 12 | | 13 | **32** |
+| 9 | 12 | | 13 | 32 |
 | 10 | 16 | | 14 | 48 |
 | 11 | 20 | | 15 | 64 |
 
-32 bytes is DLC 13. The HAL constant is literally that number:
+Two consequences.
 
-```c
-#define FDCAN_DLC_BYTES_32  ((uint32_t)0x0000000DU)
-```
+**There is no 36-byte frame.** Above 32 the next size is 48; between 8 and 12
+there is nothing. Design payloads to land on 0-8, 12, 16, 20, 24, 32, 48 or 64,
+or pay for padding on the wire.
 
-The constant exists so you never have to remember whether 32 is 12 or 13, and
-so a typo like `tx.DataLength = 32` fails loudly rather than quietly sending a
-64-byte frame (32 would be truncated into the 4-bit field). The practical
-consequences:
-
-- **There is no 36-byte frame.** If your command payload ever grows past 32
-  bytes, the next size is 48. You pad 16 bytes and pay for them on the wire.
-  Likewise nothing exists between 8 and 12. Design your payloads to land on
-  0, 4, 8, 12, 16, 20, 24, 32, 48 or 64.
-- **`rx.DataLength` comes back as the same encoded constant**, not a byte
-  count. Your `CAN_Poll()` currently ignores it entirely and copies 8 bytes
-  unconditionally. If an ESC ever sends a shorter frame you will read stale
-  bytes out of `buf` and feed them to the network as a joint position. Decode
-  it:
+**A received length comes back as the encoded constant, not a byte count.** If
+you copy a fixed number of bytes out of the receive buffer without decoding it,
+a short frame leaves you reading stale bytes from the previous message. Decode
+it:
 
 ```c
 static uint8_t dlc_to_bytes(uint32_t dlc)
@@ -651,216 +536,386 @@ static uint8_t dlc_to_bytes(uint32_t dlc)
 }
 ```
 
-### 5.4 BRS, and why yours is off
+This is also why drivers give you named constants. A typo like
+`DataLength = 32` would be truncated into the 4-bit field and quietly send a
+64-byte frame; `FDCAN_DLC_BYTES_32` cannot.
 
-With BRS on, the frame runs at the nominal bit rate through arbitration and the
-ACK, and switches to a faster data bit rate for the payload and CRC. It has to:
-arbitration requires every node to see every bit within one bit time, which
-caps the arbitration rate; the data phase has only one transmitter, so it can
-go faster.
+### 5.4 Bit rate switching
 
-You should leave it off, for three reasons.
+With BRS on, a frame runs at the nominal bit rate through arbitration and the
+acknowledge slot, then switches to a faster rate for the payload and CRC. It
+has to work that way: arbitration requires every node to see every bit within
+one bit time, which caps the arbitration rate, whereas the data phase has only
+one transmitter and can go faster.
 
-**You do not need the bandwidth.** Your cycle is a 32-byte command plus eight
-8-byte replies, 1204 bits, about 1.2 ms of a 20 ms cycle. Section 6.4 does the
-arithmetic. You are at 6% bus load. BRS solves a problem you do not have.
+BRS is not free:
 
-**Turning it on today would do nothing anyway.** Look at your own init:
+- It needs its own set of data-phase timing parameters. If those are simply a
+  copy of the nominal timing, enabling BRS changes nothing at all.
+- Above roughly 1 Mbit/s in the data phase, the transceiver loop delay no
+  longer fits inside a data bit and you must configure **transmitter delay
+  compensation**.
+- You inherit a second pair of oscillator tolerance conditions for the data
+  phase, and the GPIO slew rate on the TX pin starts to matter.
 
-```c
-hfdcan1.Init.NominalPrescaler = 5;  hfdcan1.Init.NominalTimeSeg1 = 12;
-hfdcan1.Init.DataPrescaler    = 5;  hfdcan1.Init.DataTimeSeg1    = 12;
-```
-
-The data timing is a copy of the nominal timing. Setting `BitRateSwitch =
-FDCAN_BRS_ON` would switch from 1 Mbit/s to 1 Mbit/s.
-
-**It costs you a second timing problem.** A faster data phase means a shorter
-data bit, which the transceiver's loop delay no longer fits inside. Above
-roughly 1 Mbit/s in the data phase you must configure transmitter delay
-compensation (`HAL_FDCAN_ConfigTxDelayCompensation` plus
-`HAL_FDCAN_EnableTxDelayCompensation`), you get a second pair of oscillator
-tolerance conditions to satisfy for the data phase, and `GPIO_SPEED_FREQ_LOW`
-on PH13 stops being adequate.
-
-Your current TX header is right for what you are doing:
-
-```c
-tx.FDFormat      = FDCAN_FD_CAN;     // FD frame
-tx.BitRateSwitch = FDCAN_BRS_OFF;    // one bit rate throughout
-tx.DataLength    = FDCAN_DLC_BYTES_32;
-```
-
-One thing worth adding for later: `tx.ErrorStateIndicator = FDCAN_ESI_ACTIVE`
-is a hardcoded lie if the node ever goes error-passive. The controller
-overrides it in hardware, so it does no harm, but do not read that line as a
-statement of fact about the node's state.
+If bus load is low, BRS solves a problem you do not have. Turn it on when the
+bandwidth arithmetic says you need it, not before.
 
 
-## 6. Filters, FIFOs and the H7 message RAM
+## 6. Inside the controller
 
-### 6.1 Message RAM is yours to lay out
+### 6.1 Acceptance filtering
 
-Unlike the older bxCAN, the H7's FDCAN has no fixed buffer layout. There is a
-single 10 Kbyte pool, 2560 32-bit words, shared by FDCAN1 and FDCAN2, and your
-`Init` struct carves it up. Every element you ask for is allocated from
-`MessageRAMOffset` upward, in this order: standard filters, extended filters,
-Rx FIFO0, Rx FIFO1, Rx buffers, Tx event FIFO, Tx buffers, Tx FIFO/queue.
-
-Element sizes, in 32-bit words:
-
-| element | words | note |
-|---|---|---|
-| standard filter | 1 | 11-bit IDs |
-| extended filter | 2 | 29-bit IDs |
-| Rx FIFO element, 64-byte data | 18 | 2 header + 16 data |
-| Tx FIFO element, 64-byte data | 18 | 2 header + 16 data |
-| Tx event FIFO element | 2 | |
-
-Your configuration:
+Frames are filtered in hardware before they ever reach software. A **mask
+filter** accepts when
 
 ```
-  StdFiltersNbr        =  1  x  1 word  =    1 word
-  ExtFiltersNbr        =  0                   0
-  RxFifo0ElmtsNbr      = 24  x 18 words =  432 words   (1728 B)
-  RxFifo1ElmtsNbr      =  0                   0
-  RxBuffersNbr         =  0                   0
-  TxEventsNbr          =  0                   0
-  TxBuffersNbr         =  0                   0
-  TxFifoQueueElmtsNbr  =  8  x 18 words =  144 words   ( 576 B)
-  -------------------------------------------------------------
-  total                                    577 words   (2308 B)  = 22.5% of pool
-  free for FDCAN2                         1983 words   (7932 B)
+  (received_id & mask) == (filter_id & mask)
 ```
 
-Two things follow. First, you are nowhere near the limit, so the 24-deep FIFO
-is not extravagant. Second, `MessageRAMOffset = 0` is correct only because
-FDCAN1 is the only instance in use. If you ever bring up FDCAN2 you must set
-its `MessageRAMOffset` to 577 by hand. The HAL does not do this for you and
-will happily let two peripherals write over each other's buffers, which
-produces a fault that looks like random corruption in both.
-
-You are also paying 64 bytes per element for messages that are at most 32 bytes
-long. Setting `RxFifo0ElmtSize = FDCAN_DATA_BYTES_8` would take Rx FIFO0 from
-432 words to 96, but leave it as it is: your ESCs might someday send more, and
-a frame longer than the element size is *silently truncated*, not rejected.
-
-### 6.2 What your filter actually accepts
-
-A standard mask filter accepts a frame when
-
-```
-  (received_id & FilterID2) == (FilterID1 & FilterID2)
-```
-
-Yours is `FilterID1 = 0x200`, `FilterID2 = 0x700`:
+The mask says which bits must match; zero bits are wildcards. So filter 0x200
+with mask 0x700 pins only the top three bits of an 11-bit ID:
 
 ```
   0x200 = 0b010 0000 0000
-  0x700 = 0b111 0000 0000     the mask: only the top three bits must match
+  0x700 = 0b111 0000 0000     only the top three bits must match
 
-  accepted:  0b010 xxxx xxxx  ->  0x200 through 0x2FF
+  accepted:  0b010 xxxx xxxx  ->  0x200 through 0x2FF   (256 identifiers)
 ```
 
-256 identifiers. You use eight of them. The other 248 are a hole: any node that
-one day transmits, say, 0x2A0 lands in your FIFO, gets through
-`idx = rx.Identifier - 0x200` as `idx = 0xA0`, fails the `idx < 8` test, and is
-discarded. Correct today, but it costs FIFO slots and CPU to reject traffic
-that should never have been accepted.
+If you only meant to accept eight of those, tighten the mask (0x7F8 pins all
+but the low three bits, giving exactly 0x200 to 0x207) or use a **range
+filter**, which takes a low and a high identifier and is far easier to read six
+months later.
 
-Tighten it. Two ways, both one line:
+A **global filter** decides what happens to frames matching no filter at all —
+accept into a FIFO, or reject in hardware. Reject is usually right: anything
+you did not ask for costs FIFO slots and CPU to discard in software.
 
-```c
-f.FilterType = FDCAN_FILTER_MASK;
-f.FilterID1  = 0x200;
-f.FilterID2  = 0x7F8;    // accept exactly 0x200..0x207
-```
+Most controllers also offer routing to a **dedicated receive buffer** rather
+than a FIFO. One filter per device, each pointing at its own buffer, gives each
+device a private mailbox: no queue, so a talkative node cannot displace a quiet
+one, the contents are always that node's most recent frame, and a per-buffer
+"new data" flag gives you a liveness indicator for free.
 
-or, clearer to read six months from now:
+### 6.2 FIFOs, and what a full one does
 
-```c
-f.FilterType = FDCAN_FILTER_RANGE;
-f.FilterID1  = 0x200;    // low
-f.FilterID2  = 0x207;    // high, inclusive
-```
+A receive FIFO defaults to **blocking mode**, and its behaviour when full is
+worth knowing exactly:
 
-`HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
-FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE)` is right: anything that matches no
-filter is dropped in hardware, and remote frames are dropped on both ID types.
-Remote frames do not exist in CAN FD anyway, but a classic-CAN node could still
-send one and it costs nothing to refuse it. Note that your own 0x100
-transmissions are not accepted by any filter, which is correct and also moot: a
-node does not receive its own frames in `FDCAN_MODE_NORMAL`.
-
-There is a third routing target worth knowing about, because your topology is
-the textbook case for it. `FDCAN_FILTER_TO_RXBUFFER` sends a matching frame to
-a *dedicated* Rx buffer rather than to a FIFO. Configure eight filters, one per
-ESC, each pointing at its own buffer index, and each ESC gets a private
-mailbox. There is no queue, so a talkative ESC cannot displace a quiet one, the
-contents are always that ESC's most recent frame, and the per-buffer
-"new data" flag gives you a liveness indicator for free. It costs eight filters
-and eight buffers instead of one filter and a FIFO. If the FIFO ever gives you
-trouble, this is the redesign; check the exact signatures of
-`HAL_FDCAN_IsRxBufferMessageAvailable` and the `FDCAN_RX_BUFFER0` locations in
-your HAL version before you commit to it.
-
-### 6.3 What happens when Rx FIFO0 fills
-
-The FIFO defaults to **blocking mode**. When it is full:
-
-- The incoming frame is filtered, accepted, and then *dropped*.
-- `FDCAN_RXF0S.RF0L` (message lost) is set.
-- `FDCAN_IT_RX_FIFO0_MESSAGE_LOST` fires, if you enabled it. You have not.
+- The incoming frame is filtered, accepted, and then **dropped**.
+- A "message lost" flag is set, and an interrupt fires *if you enabled it*.
 - **The node still acknowledges the frame.** Acceptance filtering and ACK
-  generation happen in the protocol engine, before the FIFO write. The ESC that
-  sent it sees a successful transmission and moves on.
+  generation happen in the protocol engine, before the FIFO write. The sender
+  sees a successful transmission and moves on.
 
-So a full FIFO is silent, lossless-looking data loss. Worse, in blocking mode
-what you lose is the *newest* frame while the FIFO keeps the oldest. For
-control feedback that is exactly backwards.
+So a full FIFO is silent data loss that looks lossless from both ends. Worse,
+in blocking mode what you lose is the *newest* frame while the FIFO keeps the
+oldest — for control feedback, exactly backwards.
 
-`HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan1, FDCAN_RX_FIFO0,
-FDCAN_RX_FIFO_OVERWRITE)` flips it so the oldest element is discarded instead.
-Read the M_CAN overwrite-mode read sequence before you enable it, though; a
-read that races an overwrite can return an inconsistent element, and there is a
-prescribed get-index dance to avoid it. Given your headroom (below), the better
-answer is to not fill the FIFO in the first place, and to *notice* if you ever
-do:
+Overwrite mode discards the oldest instead, but introduces a subtlety: a read
+that races an overwrite can return an inconsistent element, so there is a
+prescribed read sequence to follow. The better answer is usually to not fill
+the FIFO, and to *notice* if you ever do — enable the message-lost interrupt
+rather than assuming.
+
+### 6.3 Message RAM
+
+Modern CAN controllers give you a single pool of RAM and let you carve it up:
+filters, receive FIFOs, receive buffers, transmit event FIFO, transmit buffers,
+transmit FIFO. You declare how many of each and how large the data field is,
+and everything is allocated from a base offset upward in a fixed order.
+
+Two things to watch:
+
+- **A frame longer than the configured element size is silently truncated, not
+  rejected.** Sizing elements down to save RAM is a real trade.
+- **If the pool is shared between two CAN instances, the second one's base
+  offset is yours to compute.** Drivers generally will not do it for you, and
+  will happily let two peripherals overwrite each other's buffers — which
+  presents as random corruption in both.
+
+
+## 7. Errors and fault confinement
+
+### 7.1 The five errors
+
+Every node detects all five, not just the two involved in a transfer:
+
+| error | condition |
+|---|---|
+| **bit** | transmitted one level, sampled the other (outside arbitration and ACK) |
+| **stuff** | six consecutive bits of the same value where stuffing forbids it |
+| **form** | a fixed-form field held the wrong value (delimiters, EOF, FDF) |
+| **CRC** | computed CRC differs from the received one |
+| **ACK** | transmitter sampled recessive in the acknowledge slot |
+
+The two bit-error directions are the most useful diagnostic split you have:
+sent dominant, read recessive means *my transmitter is not reaching the bus*;
+sent recessive, read dominant means *something else is driving the bus*.
+
+A node detecting any of these transmits an **error flag**: six dominant bits.
+That deliberately violates bit stuffing, so every other node sees a stuff error
+and joins in, and the frame is destroyed globally. The transmitter then
+retries. Error handling is a bus-wide property, not a per-link one.
+
+### 7.2 Error-active, error-passive, bus-off
+
+Two hardware counters: transmit error count (TEC) and receive error count
+(REC).
+
+```
+  TEC <= 127 and REC <= 127   ERROR ACTIVE
+                              Sends 6 dominant bits as an error flag. Full
+                              participant; destroys bad frames for everyone,
+                              which is the point.
+
+  TEC > 127 or REC > 127      ERROR PASSIVE
+                              Sends 6 *recessive* bits as an error flag, which
+                              changes nothing on the wire. Still transmits and
+                              receives, but must wait an extra 8 recessive bits
+                              before starting a frame, so it yields to healthy
+                              nodes.
+
+  TEC > 255                   BUS OFF
+                              Stops entirely. Drives nothing, acknowledges
+                              nothing.
+```
+
+Roughly: a transmit error is +8 on TEC, a receive error +1 on REC, and a
+success is -1. The 8-to-1 asymmetry is deliberate — the node causing the
+trouble climbs eight times faster than the nodes merely observing it, so a
+faulty node removes itself rather than taking the bus down with it.
+
+**One exception matters more than it looks.** An error-passive transmitter that
+detects an ACK error does not increment TEC. A node transmitting into a bus
+where nothing answers will therefore climb to 128, go error-passive, and then
+*freeze there* — retransmitting forever, never reaching bus-off. Section 14
+walks through why that is the single most confusing first-bring-up symptom.
+
+### 7.3 Recovery
+
+Recovery from bus-off requires 128 occurrences of 11 consecutive recessive bits
+on the receive input. At 1 Mbit/s on an idle bus that is at least 1.4 ms.
+
+On many modern controllers — the STM32 FDCAN among them — this does **not**
+happen automatically. The peripheral sets its init bit and stops, and stays
+stopped until software clears it. Older peripherals had an automatic bus-off
+management bit; do not assume it is there.
+
+Two rules for a recovery handler:
+
+- **Do not recover in a tight loop.** If the fault is permanent you will
+  thrash. Rate limit, count, and after a threshold stop trying and fail safe.
+- **Decide what the application does when the bus dies**, and decide it before
+  it happens rather than while it is happening.
+
+
+## 8. The physical bus
+
+### 8.1 Termination
+
+Exactly **two** 120 ohm resistors, one across CANH-CANL at each physical *end*
+of the trunk. Not at every node, not in the middle.
+
+```
+   [node]      [node]  [node]  ...  [node]        [node]
+      |          |       |            |             |
+120R==+==========+=======+============+=============+==120R
+      |          |       |            |             |
+                 ^ stubs must be short, < 30 cm at 1 Mbit/s
+```
+
+The two in parallel present 60 ohm to whichever transceiver is driving — the
+load a 2 V dominant differential is specified into.
+
+Termination does two jobs and people usually remember only the first. It
+absorbs reflections. It also provides the resistive path that pulls the pair
+back to zero differential when every driver releases for a recessive bit. That
+second job sets how fast recessive recovery is, and it is the one that bites
+first, because the dominant-to-recessive edge is *passive*.
+
+| mistake | CANH-CANL, power off | symptom |
+|---|---|---|
+| none fitted | open | slow recessive recovery, ringing, random stuff and form errors that worsen under load |
+| one only | 120 ohm | reflections off the open end; often works on a short bench harness and fails in the real machine |
+| three or more | 40 ohm or less | transceiver cannot pull the differential to its minimum; the far end fails first |
+| fitted at middle nodes | 60 ohm, looks correct | sections beyond the terminators are unterminated stubs and ring |
+
+The three-terminator case is the one to actually worry about, because most
+transceiver breakout boards ship with a 120 ohm resistor already fitted. Nine
+boards is nine resistors in parallel, 13 ohm, and nothing works at all. Check
+every board and remove all but two.
+
+**How to check, in order.** Power off, measure CANH to CANL: you want **60
+ohm**. 120 means one terminator, 40 means three, open means none, near zero
+means a short. Then CANH to ground and CANL to ground: both should be megohms.
+Power on and idle, both wires should sit near 2.5 V with under 0.5 V between
+them.
+
+### 8.2 Topology
+
+Daisy-chain, never star. Keep the pair twisted right up to each connector. At
+1 Mbit/s the theoretical length limit is around 40 m, so on anything
+desk-sized length is not the problem — **stub length and star topology are**.
+
+
+# Part II — How the firmware uses it
+
+Part I was the protocol. This part maps this repository's firmware onto it,
+at the level of what each piece is for and why it is shaped that way.
+
+## 9. The shape of the driver
+
+There is no CAN library here. The Arduino core does not wrap the H7's FDCAN
+peripheral, so `src/main.cpp` talks to ST's HAL directly, with the
+initialisation code originally generated by STM32CubeMX and then hand-edited.
+
+Four pieces, all in `src/main.cpp`:
+
+| piece | job | Part I section |
+|---|---|---|
+| `HAL_FDCAN_MspInit()` | clocks and pins: turns on the FDCAN kernel clock, configures the PLL that feeds it, muxes the TX/RX pins | 1.3, 1.4, 3.1 |
+| `MX_FDCAN1_Init()` | the peripheral: bit timing, frame format, message RAM sizing, filters, then start | 3, 5, 6 |
+| `CAN_SendActions()` | builds one transmit header and queues one frame | 2, 5.3 |
+| `CAN_Poll()` | drains the receive FIFO and unpacks frames into the observation arrays | 6.1, 6.2 |
+
+`HAL_FDCAN_MspInit` is worth a note: you never call it. `HAL_FDCAN_Init()`
+calls it internally when the handle is in its reset state. That is why the
+clock and pin setup lives in a function that appears to have no caller.
+
+The whole driver is polled. `Model()` sends, waits, then drains — there are no
+CAN interrupts enabled, which is the root of several items in section 16.
+
+## 10. Where the bit rate comes from
+
+This is the chain worth understanding, because a break anywhere in it changes
+the bit rate silently (3.2).
+
+```
+  HSE crystal  ->  PLL1  ->  SYSCLK          (SystemClock_Config)
+       |
+       +-------->  PLL2  ->  fdcan_ker_ck    (HAL_FDCAN_MspInit)
+                              |
+                              +-> prescaler -> t_q -> bit rate (MX_FDCAN1_Init)
+```
+
+The subtlety: **PLL1 and PLL2 share one input source**. On the H7,
+`RCC_PLLCKSELR.PLLSRC` feeds all three PLLs; only the per-PLL `DIVM` dividers
+differ. So PLL2's input is whatever `SystemClock_Config()` chose for PLL1 —
+which means changing the system clock source silently changes the CAN kernel
+clock, and therefore the bit rate.
+
+That is exactly what happened when this project moved from the internal RC to
+the crystal. The kernel clock changed, and the bit timing had to be re-derived
+to keep the same bit rate. Both `HAL_FDCAN_MspInit()`'s PLL2 values and
+`MX_FDCAN1_Init()`'s segment values had to change together.
+
+`SystemClock_Config()` here is declared `extern "C"` deliberately. The Arduino
+core provides a `WEAK` default; a strong C-linkage definition overrides it. In
+a `.cpp` file without `extern "C"` the name would be mangled, the override
+would silently not happen, and the board would run on the core's clock tree
+while the CAN timing assumed otherwise — which is the silent-bit-rate failure
+of 3.2, arrived at from an unexpected direction.
+
+**The one thing to verify on hardware rather than infer.** Everything in
+sections 3 and 4 depends on the kernel clock actually being what the
+arithmetic assumes:
 
 ```c
-// call once, after HAL_FDCAN_Init and before HAL_FDCAN_Start
-HAL_FDCAN_ActivateNotification(&hfdcan1,
-    FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_BUS_OFF |
-    FDCAN_IT_ERROR_PASSIVE        | FDCAN_IT_ERROR_WARNING, 0);
+static void ReportClocks(void)
+{
+  Serial_.print("SYSCLK       = "); Serial_.println(HAL_RCC_GetSysClockFreq());
+  Serial_.print("HCLK         = "); Serial_.println(HAL_RCC_GetHCLKFreq());
+  Serial_.print("fdcan_ker_ck = ");
+  Serial_.println(HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN));
+  Serial_.print("PLL src (0=HSI 1=CSI 2=HSE) = ");
+  Serial_.println((RCC->PLLCKSELR & RCC_PLLCKSELR_PLLSRC)
+                  >> RCC_PLLCKSELR_PLLSRC_Pos);
+}
 ```
 
-### 6.4 Is polling once per 20 ms safe with eight nodes
+Call it after `MX_FDCAN1_Init()` — PLL2 does not exist until
+`HAL_FDCAN_MspInit()` has run.
 
-Two separate questions: does the FIFO overflow, and is the data fresh. The
-answers are no and no.
+## 11. The message scheme
 
-**Capacity.** Count the wire time. Frame field counts at 1 Mbit/s, excluding
-stuff bits and including the 3-bit intermission:
-
-| frame | fields | bits | time |
-|---|---|---|---|
-| your command: FD, no BRS, 32 bytes, CRC-21 | 22 + 256 + 4 + 21 + 10 | 313 (+3) | 316 us |
-| ESC reply: classic, 8 bytes | 44 + 64 | 108 (+3) | 111 us |
-| ESC reply: FD no BRS, 8 bytes, CRC-17 | 22 + 64 + 4 + 17 + 10 | 117 (+3) | 120 us |
-
-One control cycle, with classic 8-byte replies:
+Two identifiers, following 2.2:
 
 ```
-  316 + 8 x 111 = 1204 bit times = 1204 us
-  bus load = 1204 / 20000 = 6.0%          (call it 7.5% with worst-case stuffing)
+  0x100          mainboard -> all ESCs, broadcast
+                 one FD frame, 32 bytes = 8 floats of joint commands
+
+  0x200 + n      ESC n -> mainboard, n = 0..7
+                 8 bytes = joint position float, then joint velocity float
 ```
 
-Eight frames arrive per 20 ms into a 24-deep FIFO, so you have three cycles,
-60 ms, of slack. The FIFO overflows only if the `Model` task stalls for longer
-than that. Your inference time is the risk; time `entry()` and check. Capacity
-is fine.
+Commands sit below feedback, so a command always wins arbitration against a
+backlog of replies — the right way round (2.2). The eight replies then
+serialise themselves in ESC order with no coordination, which is arbitration
+doing exactly what section 2.1 describes.
 
-**Freshness is not fine.** Look at what the loop does:
+The broadcast is the right shape too: one 32-byte frame carries all eight joint
+targets for one arbitration and one set of overhead, where eight separate small
+frames would cost roughly twice the wire time for the same payload.
+
+`0x000` to `0x0FF` is currently unused and sits *above* the commands in
+priority. That is where an emergency stop belongs.
+
+## 12. The transmit path
+
+`CAN_SendActions()` fills an `FDCAN_TxHeaderTypeDef` and queues it. The fields
+that matter, against Part I:
+
+```c
+tx.IdType        = FDCAN_STANDARD_ID;    // 11-bit, section 2.1
+tx.FDFormat      = FDCAN_FD_CAN;         // FD frame, section 5.1
+tx.BitRateSwitch = FDCAN_BRS_OFF;        // one bit rate throughout, section 5.4
+tx.DataLength    = FDCAN_DLC_BYTES_32;   // DLC 13, not 32, section 5.3
+```
+
+BRS is off and should stay off: the data-phase timing in `MX_FDCAN1_Init()` is
+a copy of the nominal timing, so turning it on would switch from 1 Mbit/s to
+1 Mbit/s while adding a transmitter-delay-compensation problem (5.4).
+
+One field is a hardcoded lie worth knowing about:
+`tx.ErrorStateIndicator = FDCAN_ESI_ACTIVE` claims the node is error-active.
+Hardware overrides it, so it does no harm — but do not read that line as a
+statement of fact about the node's state (7.2).
+
+`CAN_SendActions()` returns a bool that is currently discarded. That bool is
+the only in-band signal that the transmit FIFO has wedged, which is precisely
+the symptom of the failure in section 14.
+
+## 13. The receive path
+
+`CAN_Poll()` drains the FIFO into `joint_pos[]` and `joint_vels[]`, indexing by
+`identifier - 0x200`.
+
+The filter is a mask filter, `FilterID1 = 0x200`, `FilterID2 = 0x700`. By 6.1
+that accepts `0x200` through `0x2FF` — 256 identifiers for eight ESCs. The
+`idx < 8` guard in software discards the rest, so nothing breaks, but 248
+identifiers are being accepted into the FIFO only to be thrown away. A mask of
+`0x7F8`, or a range filter of 0x200 to 0x207, expresses the actual intent.
+
+The global filter rejects non-matching frames and remote frames in hardware,
+which is right (6.1). Note that the node's own 0x100 transmissions match no
+filter — correct, and moot anyway, since a node does not receive its own frames
+in normal mode.
+
+Two gaps against Part I:
+
+**The received length is ignored.** `CAN_Poll()` copies 8 bytes
+unconditionally without decoding `rx.DataLength` (5.3). If an ESC ever sends a
+shorter frame, stale bytes from the previous message get fed to the network as
+a joint position.
+
+**There is no staleness tracking.** If an ESC drops off the bus entirely, its
+entry in `joint_pos[]` keeps its last value forever and the policy walks on a
+leg that stopped reporting. A silent ESC is currently indistinguishable from a
+stationary one. Per-ESC last-seen timestamps and a staleness mask fix this.
+
+There is also a timing question. The control loop does:
 
 ```c
 CAN_SendActions(actions);
@@ -868,159 +923,82 @@ vTaskDelay(pdMS_TO_TICKS(2));
 CAN_Poll();
 ```
 
-The bus needs 1204 us minimum. `vTaskDelay(pdMS_TO_TICKS(2))` at the default
-1000 Hz FreeRTOS tick is `vTaskDelay(2)`, and `vTaskDelay(n)` unblocks on the
-nth tick boundary *after* the call. Since the call lands at an arbitrary point
-inside the current tick, the real delay is anywhere between 1.0 ms and 2.0 ms.
+A command plus eight replies needs roughly 1.2 ms of wire time. But
+`vTaskDelay(2)` at a 1 kHz tick unblocks on the *second tick boundary after the
+call*, and the call lands at an arbitrary point inside the current tick — so
+the real delay is anywhere between 1.0 and 2.0 ms. At the short end you poll
+while the last ESCs are still transmitting. Their frames are not lost; they sit
+in the FIFO and get read on the *next* cycle, 20 ms later. So some of the time,
+two joints feed the network data that is one full control period old, and
+nothing reports it.
 
-At the short end you poll after 1.0 ms, while ESC 6 and ESC 7 are still on the
-wire. Their frames are not lost, they sit in the FIFO and get read on the next
-poll, 20 ms later. So roughly half the time, two of your eight joints feed the
-network a position and velocity that are one full control period old, and
-nothing anywhere reports it. On a walking policy that is a real defect and it
-will look like a gait problem, not a bus problem.
+Widening the window is the cheap fix. Waiting for the expected count with a
+deadline is better. Best is to stop polling: enable the receive interrupt,
+drain in the callback, and notify the control task when all eight have arrived.
 
-Three fixes, in increasing order of correctness.
+## 14. Bringing a bus up safely
 
-*Cheapest.* Widen the window and drain again just before you build the
-observation:
+Section 7.2 mentioned an exception that freezes TEC at 128. Here is why it
+matters, because it produces the most convincing wrong-looking-right you will
+meet.
 
-```c
-CAN_SendActions(actions);
-vTaskDelay(pdMS_TO_TICKS(4));   // >= 1204 us of bus time plus ESC latency
-CAN_Poll();
-```
+**Going straight to normal mode on a bus with no other node**, with a working
+transceiver:
 
-*Better.* Wait for the count you expect, with a deadline, so the loop adapts:
+1. The frame transmits cleanly. Bit monitoring passes — every dominant bit
+   comes back through the transceiver's own receiver.
+2. At the acknowledge slot the transmitter expects some other node to drive
+   dominant. There are no other nodes. **ACK error**, `TEC += 8`.
+3. With automatic retransmission enabled, it retries. After sixteen attempts,
+   about 5 ms in, `TEC = 128` and the node goes error-passive.
+4. The exception from 7.2 now applies: an error-passive transmitter detecting
+   an ACK error does not increment TEC. **The counter freezes at 128.**
+5. So it never reaches bus-off. It retransmits the same frame forever, at
+   roughly 3000 attempts per second, at 100% bus utilisation.
 
-```c
-static uint32_t esc_last_seen_ms[8];
+What you observe: nothing. No error printed, the control loop keeps its period,
+and on a scope the TX pin is a continuous stream of well-formed frames. The
+only symptom is `TEC = 128, ErrorPassive = 1, LastErrorCode = ack`, frozen —
+visible only if you are reading the protocol status.
 
-static uint32_t CAN_PollUntil(uint32_t want, uint32_t timeout_us)
-{
-  uint32_t t0 = micros(), got = 0;
-  uint8_t  seen = 0;                       // bitmask of ESCs heard from
-  while ((micros() - t0) < timeout_us && got < want)
-  {
-    FDCAN_RxHeaderTypeDef rx;
-    uint8_t buf[64];
-    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0)
-    {
-      if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx, buf) != HAL_OK)
-        break;
-      uint32_t idx = rx.Identifier - CAN_ID_FB_BASE;
-      if (idx < 8 && dlc_to_bytes(rx.DataLength) >= 8)
-      {
-        memcpy(&joint_pos[idx],  &buf[0], 4);
-        memcpy(&joint_vels[idx], &buf[4], 4);
-        esc_last_seen_ms[idx] = millis();
-        if (!(seen & (1u << idx))) { seen |= (1u << idx); got++; }
-      }
-    }
-    if (got < want) taskYIELD();
-  }
-  return got;                              // caller decides what a shortfall means
-}
-```
+**With no transceiver, or one whose standby pin is floating**, it is different
+and much faster: the TX pin drives dominant, nothing converts it, the RX pin
+never goes dominant, and the transmitter sees a **bit error** on the first bit.
+The ACK exception does not apply, TEC climbs freely, and the node is bus-off in
+well under a millisecond — where, per 7.3, it stays until software intervenes.
+Same visible symptoms: none.
 
-*Best.* Stop polling. Enable `FDCAN_IT_RX_FIFO0_NEW_MESSAGE`, drain in
-`HAL_FDCAN_RxFifo0Callback`, and have the ISR give a FreeRTOS notification to
-the `Model` task once it has all eight. The control task then blocks on the
-notification with a timeout instead of guessing at a delay.
+**The bring-up ladder.** Each rung isolates one thing, and each takes about ten
+minutes:
 
-Whichever you pick, add the staleness check. Right now, if an ESC drops off the
-bus entirely, `joint_pos[i]` keeps its last value forever and the network walks
-on a leg that is not reporting:
+| mode | drives the pin | needs an ACK | proves |
+|---|---|---|---|
+| internal loopback | no | no | message RAM, filters, DLC, your framing code |
+| **external loopback** | **yes** | no | the pin, transceiver, harness, termination |
+| bus monitoring | no | no | your bit timing matches a real transmitter |
+| normal | yes | yes | everything |
 
-```c
-static uint8_t CAN_StaleMask(uint32_t max_age_ms)
-{
-  uint8_t stale = 0;
-  for (int i = 0; i < 8; i++)
-    if (millis() - esc_last_seen_ms[i] > max_age_ms) stale |= (1u << i);
-  return stale;
-}
-```
+**External loopback is the rung most people skip and the one that matters
+most.** The controller transmits real frames out of the pin, through the
+transceiver, onto the real wire where you can scope them — but feeds its
+receiver internally and ignores acknowledge errors. A live, correctly-timed
+waveform to measure, with no second node and no error counters climbing.
 
-### 6.5 Two smaller things in `CAN_Poll`
+**Bus monitoring** is the other one. The node never drives a dominant bit, so
+it cannot ACK and cannot disturb anything. Power one ESC, let it transmit, and
+see whether frames land in your FIFO. If they do, your bit timing and filter
+are both proven. If they do not and the ESC is definitely sending, your bit
+rate does not match.
 
-`rx.DataLength` is ignored, so a short frame reads stale bytes out of `buf`.
-Section 5.3 has the decode table; the guard is in `CAN_PollUntil` above.
+## 15. Instrumentation
 
-`CAN_SendActions` returns a bool that `Model()` throws away:
+The theme of sections 10, 13 and 14 is that CAN failures are silent in
+software. Two functions turn most of this document into printed lines.
 
-```c
-CAN_SendActions(actions);      // returns false when the Tx FIFO is full
-```
+`ReportClocks()` from section 10, once at startup. If the kernel clock is not
+what the bit timing assumes, nothing else matters.
 
-That bool is your only indication that the bus has stopped working. Section 8.1
-is about the case where it goes false forever and nothing else changes.
-
-
-## 7. Errors
-
-### 7.1 What the controller detects
-
-Five error types, all detected by every node, not just the two involved:
-
-| error | condition | `LastErrorCode` |
-|---|---|---|
-| bit | transmitted a level, sampled the other one (outside arbitration and ACK) | `FDCAN_PROTOCOL_ERROR_BIT0` / `_BIT1` |
-| stuff | six consecutive bits of the same value where stuffing forbids it | `_STUFF` |
-| form | a fixed-form field held the wrong value (delimiters, EOF, FDF) | `_FORM` |
-| CRC | computed CRC differs from the received one | `_CRC` |
-| ACK | transmitter sampled recessive in the ACK slot | `_ACK` |
-
-`_BIT0` means it sent dominant and read recessive. `_BIT1` means it sent
-recessive and read dominant. Those two distinguish "my transmitter is not
-reaching the bus" from "something else is driving the bus", which is the single
-most useful diagnostic split you have.
-
-A node that detects any of these transmits an **error flag**: six dominant
-bits. That deliberately violates bit stuffing, so every other node sees a stuff
-error and joins in, and the frame is destroyed globally. The transmitter then
-retries. This is why error handling is a bus-wide property, not a per-link one.
-
-### 7.2 The three states
-
-Two counters, both maintained in hardware. Transmit error counter (TEC) and
-receive error counter (REC).
-
-```
-  TEC <= 127 and REC <= 127     ERROR ACTIVE
-                                sends 6 dominant bits as an error flag.
-                                Full participant. Destroys bad frames for
-                                everyone, which is the point.
-
-  TEC > 127 or REC > 127        ERROR PASSIVE
-                                sends 6 *recessive* bits as an error flag,
-                                which changes nothing on the wire. Still
-                                transmits and receives, but must wait an extra
-                                8 recessive bits (suspend transmission) before
-                                starting a new frame, so it yields to healthy
-                                nodes.
-
-  TEC > 255                     BUS OFF
-                                stops entirely. Drives nothing, ACKs nothing.
-```
-
-Rough counting rules: a transmit error is worth +8 on TEC, a receive error +1
-on REC, and a successful transmit or receive is worth -1. The 8-to-1 asymmetry
-is deliberate: the node causing the trouble climbs eight times faster than the
-nodes merely observing it, so a single faulty node removes itself rather than
-taking the bus down.
-
-One exception matters enormously for section 8. **An error-passive transmitter
-that detects an ACK error does not increment TEC.** That single rule is why the
-first thing you are about to do produces the failure mode it does.
-
-Bus-off recovery requires 128 occurrences of 11 consecutive recessive bits on
-the RX input (ST's FDCAN documentation says 129 for this implementation). At
-1 Mbit/s on an idle bus that is at least 1.4 ms. And on the H7 it does not start
-until *software* clears `CCCR.INIT`. There is no `ABOM` bit here; that was
-bxCAN. FDCAN never recovers on its own.
-
-### 7.3 Reading it, in your HAL
+A protocol-status dump, once a second:
 
 ```c
 static void CAN_ReportStatus(void)
@@ -1029,511 +1007,150 @@ static void CAN_ReportStatus(void)
   FDCAN_ErrorCountersTypeDef  ec;
   HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps);
   HAL_FDCAN_GetErrorCounters(&hfdcan1, &ec);
+  static const char *lec[8] = {"none","stuff","form","ack","bit1","bit0","crc","nochange"};
 
-  static const char *lec[8] = {
-    "none", "stuff", "form", "ack", "bit1", "bit0", "crc", "nochange"
-  };
-
-  Serial_.print("TEC=");        Serial_.print(ec.TxErrorCnt);
-  Serial_.print(" REC=");       Serial_.print(ec.RxErrorCnt);
-  Serial_.print(" lec=");       Serial_.print(lec[ps.LastErrorCode & 7]);
-  Serial_.print(" warn=");      Serial_.print(ps.Warning);
-  Serial_.print(" passive=");   Serial_.print(ps.ErrorPassive);
-  Serial_.print(" busoff=");    Serial_.println(ps.BusOff);
+  Serial_.print("TEC=");      Serial_.print(ec.TxErrorCnt);
+  Serial_.print(" REC=");     Serial_.print(ec.RxErrorCnt);
+  Serial_.print(" lec=");     Serial_.print(lec[ps.LastErrorCode & 7]);
+  Serial_.print(" passive="); Serial_.print(ps.ErrorPassive);
+  Serial_.print(" busoff=");  Serial_.println(ps.BusOff);
 }
 ```
 
-`LastErrorCode` is sticky-until-read in the sense that it holds the last error
-seen; `FDCAN_PROTOCOL_ERROR_NO_CHANGE` (7) means no new error since it was last
-written. Call this once a second from a low-priority task and you have turned
-every failure in this document into a printed line.
-
-The interpretation table, which is most of the debugging you will ever do:
+Which you read with this table — most of the debugging you will ever do:
 
 | what you see | what it means |
 |---|---|
-| `TEC=0 REC=0 lec=none` | nothing has been transmitted, or everything worked |
-| `TEC=128 passive=1 lec=ack`, frozen | you are transmitting and nobody is acknowledging. Section 8.1 |
-| `TEC` climbing to 256, `lec=bit0` | your dominant bits are not coming back. Transceiver disabled, unpowered, or not fitted |
-| `lec=bit1` while idle | something else is holding the bus dominant. Shorted CANH/CANL, or a stuck node |
-| `lec=stuff` or `form`, intermittent | bit rate mismatch, bad termination, or a clock out of tolerance |
-| `lec=crc` | data corruption on the wire. Reflections, noise, missing twist |
-| `busoff=1` | 32 or more consecutive failed transmissions. Recover explicitly, see below |
-
-### 7.4 Recovering from bus-off
-
-Two parts: notice, and restart.
-
-```c
-// in MX_FDCAN1_Init, before HAL_FDCAN_Start
-HAL_FDCAN_ActivateNotification(&hfdcan1,
-    FDCAN_IT_BUS_OFF | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING |
-    FDCAN_IT_RX_FIFO0_MESSAGE_LOST, 0);
-// FreeRTOS: any ISR that calls a FromISR API must be numerically at or above
-// configMAX_SYSCALL_INTERRUPT_PRIORITY, i.e. a *lower* logical priority. 5 is
-// safe with the STM32duino default; check yours before adding a notification.
-HAL_NVIC_SetPriority(FDCAN1_IT0_IRQn, 5, 0);
-HAL_NVIC_EnableIRQ(FDCAN1_IT0_IRQn);
-
-extern "C" void FDCAN1_IT0_IRQHandler(void) { HAL_FDCAN_IRQHandler(&hfdcan1); }
-
-volatile uint32_t can_busoff_count = 0;
-
-extern "C" void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *h,
-                                              uint32_t ErrorStatusITs)
-{
-  if (ErrorStatusITs & FDCAN_IT_BUS_OFF)
-  {
-    can_busoff_count++;
-    // ST's documented recovery: clear INIT so the controller starts counting
-    // its 11-recessive-bit sequences. HAL_FDCAN_Start() will not do this,
-    // because the handle is still in HAL_FDCAN_STATE_BUSY.
-    CLEAR_BIT(h->Instance->CCCR, FDCAN_CCCR_INIT);
-  }
-}
-```
-
-`CLEAR_BIT` on `CCCR.INIT` is what ST's own note recommends and is the minimal
-correct action. The pure-HAL alternative is `HAL_FDCAN_Stop()` followed by
-`HAL_FDCAN_Start()`, which additionally aborts everything queued in the Tx
-FIFO. That is usually what you want on a robot: after a bus fault, the eight
-joint commands sitting in the queue are stale by hundreds of milliseconds and
-you would rather send fresh ones.
-
-Do not recover in a tight loop. If the fault is permanent you will thrash. Rate
-limit, count, and after some threshold stop trying and fail safe:
-
-```c
-if (can_busoff_count > 10) { /* hold position, stop the gait, say so */ }
-```
-
-Which raises the question you have to answer in the policy, not the driver:
-what does a walking robot do when its motor bus dies? Deciding that now is
-cheaper than deciding it while the robot falls over.
-
-
-## 8. Four questions
-
-### 8.1 What happens the first time you run `FDCAN_MODE_NORMAL` on an empty bus
-
-Two completely different things happen depending on whether your transceiver is
-alive, and neither of them looks like a failure from software. Work out which
-one you are in before you start guessing.
-
-**Case A: transceiver powered, `STB` low, bus terminated, no other node.**
-
-1. `HAL_FDCAN_AddMessageToTxFifoQ` queues the 32-byte command. The controller
-   starts transmitting on PH13. The transceiver drives CANH/CANL.
-2. Every dominant bit comes back through the transceiver's own receiver onto
-   PI9 within its loop delay. Bit monitoring passes. Arbitration is won by
-   default. The frame transmits cleanly all 313 bits.
-3. At the ACK slot the transmitter sends recessive and expects to sample
-   dominant, because in CAN *every* node that received the frame correctly
-   drives the ACK bit, including nodes that had no interest in it. There are no
-   other nodes. It samples recessive.
-4. **ACK error.** `LastErrorCode` becomes `FDCAN_PROTOCOL_ERROR_ACK`. Being
-   error-active, the node transmits an active error flag, six dominant bits,
-   destroying its own frame. `TEC += 8`.
-5. Error delimiter, intermission, and because `AutoRetransmission = ENABLE`,
-   it retries the same frame. About 322 bit times per attempt, so about 322 us.
-6. After 16 attempts, roughly 5 ms after you switched to normal mode,
-   `TEC = 128`, which is greater than 127, and the node goes **error-passive**.
-7. Here is the part that is not obvious. An error-passive transmitter that
-   detects an ACK error and sees no dominant bit during its passive error flag
-   **does not increment TEC**. The counter freezes at 128.
-8. So the node never reaches bus-off. It retransmits the same frame, forever,
-   at roughly 3000 attempts per second, at 100% bus utilisation, with
-   `TEC = 128` and `busoff = 0`, for as long as the robot is powered.
-
-What you observe, with the code exactly as it is today:
-
-- Nothing on the serial console. `MX_FDCAN1_Init` printed no error and
-  `Error_Handler()` was not called.
-- `joint_pos[]` and `joint_vels[]` stay at their initialised zeros forever, so
-  the network runs on a zero observation and produces whatever it produces.
-- The eyes blink. The IMU works. The 50 Hz loop keeps its period.
-- For the first 160 ms, `CAN_SendActions()` returns `true`: the head of the Tx
-  FIFO is stuck retrying, but there are 8 slots and `Model` only adds one every
-  20 ms. On the ninth call the FIFO is full, `HAL_FDCAN_AddMessageToTxFifoQ`
-  returns `HAL_ERROR`, and `CAN_SendActions` returns `false` from then on.
-  `Model()` discards that return value, so this changes nothing you can see.
-- On a scope, PH13 is a continuous stream of well-formed frames. It looks like
-  a working bus. It is the most convincing wrong-looking-right you will get.
-
-The only symptom is `TEC = 128, ErrorPassive = 1, LastErrorCode = ack`, frozen,
-which you can only see if you added `CAN_ReportStatus()` from 7.3. Add it
-before you flash.
-
-**Case B: transceiver absent, unpowered, or `STB` floating/high.**
-
-Completely different, and much faster.
-
-1. The controller drives PH13 dominant for SOF. Nothing converts it, so PI9
-   never goes dominant.
-2. The transmitter monitors the bus, sent dominant, sampled recessive. **Bit
-   error**, `FDCAN_PROTOCOL_ERROR_BIT0`. The frame dies at bit 1. `TEC += 8`.
-3. The ACK-error exception does not apply, because this is not an ACK error.
-   TEC keeps climbing. It climbs faster still if the node also detects bit
-   errors while transmitting its own error flag, which it will.
-4. After 32 or fewer attempts, and each attempt is only about 18 bit times,
-   `TEC > 255` and the node goes **bus-off**. Elapsed time: well under a
-   millisecond.
-5. Bus-off sets `CCCR.INIT` in hardware and the peripheral stops. On the H7
-   there is no automatic recovery. It stays there.
-6. The Tx FIFO fills within 160 ms and `CAN_SendActions` returns `false`
-   forever. Again discarded.
-
-Same visible symptoms as case A: none. Same fix: read the protocol status.
-
-**What to do instead of flipping straight to normal mode.** There is a bring-up
-ladder, and each rung isolates one thing:
-
-| mode | drives PH13 | needs an ACK | proves |
-|---|---|---|---|
-| `FDCAN_MODE_INTERNAL_LOOPBACK` | no | no | message RAM, filters, DLC, your framing code |
-| `FDCAN_MODE_EXTERNAL_LOOPBACK` | **yes** | no | the pin, the transceiver, the harness, termination |
-| `FDCAN_MODE_BUS_MONITORING` | no | no | your bit timing matches a real transmitter |
-| `FDCAN_MODE_NORMAL` | yes | yes | everything |
-
-`FDCAN_MODE_EXTERNAL_LOOPBACK` is the rung you are missing and it is the
-important one. The controller transmits real frames out of PH13 and through the
-transceiver onto the real wire, where you can put a scope on them, but it feeds
-its receiver internally and ignores acknowledge errors. So you get a live,
-correctly-timed CAN waveform to measure against, with no second node required
-and no error counters climbing.
-
-`FDCAN_MODE_BUS_MONITORING` is the other one worth knowing. The node never
-drives a dominant bit, so it cannot ACK and cannot disturb anything. Power one
-ESC, let it transmit, and see whether frames land in your FIFO. If they do,
-your bit timing and your filter are both right, and you have proved it without
-risk. If they do not, and the ESC is definitely transmitting (scope it), your
-bit rate does not match.
-
-Run the ladder in order. Each rung takes ten minutes and eliminates a category.
-
-### 8.2 Termination
-
-**Where.** Exactly two 120 ohm resistors, one across CANH-CANL at each physical
-*end* of the trunk. Not at every node. Not in the middle. A CAN bus is a
-transmission line of roughly 120 ohm characteristic impedance and you terminate
-both ends of it, the same as any other transmission line.
-
-```
-   [mainboard]   [ESC0]  [ESC1]  ...  [ESC6]        [ESC7]
-        |          |       |            |             |
-  120R==+==========+=======+============+=============+==120R
-        |          |       |            |             |
-                   ^ stubs must be short, < 30 cm at 1 Mbit/s
-```
-
-The two resistors in parallel present 60 ohm to whichever transceiver is
-driving. That is the load the 2 V dominant differential is specified into.
-
-Termination does two jobs, and people usually only remember the first. It
-absorbs reflections. It also provides the resistive path that pulls the pair
-back to zero differential when every driver releases for a recessive bit. That
-second job sets how fast recessive recovery is, and it is the one that bites
-first, because the dominant-to-recessive edge is passive.
-
-**What goes wrong.**
-
-| mistake | resistance CANH-CANL, power off | symptom |
-|---|---|---|
-| none fitted | open, megohms | slow recessive recovery, ringing, noise pickup on a high-impedance bus, random stuff and form errors that get worse when motors run |
-| one only | 120 ohm | reflections off the open end; dominant level higher than spec into the lighter load; often works on a short bench harness and fails in the robot |
-| three or more | 40 ohm or less | transceiver cannot pull the differential to the 1.5 V minimum; the far end of the bus fails first |
-| fitted at middle nodes | 60 ohm, looks correct | the sections beyond the terminators are unterminated stubs and ring |
-
-The three-terminator case is the one to actually worry about, because most CAN
-transceiver breakout boards ship with a 120 ohm resistor already soldered on.
-Eight ESC breakouts plus the mainboard is nine resistors in parallel, 13 ohm,
-and nothing works at all. Check every board and desolder or unjumper all but
-two.
-
-**How to check, in order.**
-
-1. Power the whole bus off. Multimeter on resistance, probes on CANH and CANL
-   at any point on the trunk. You want **60 ohm**, give or take a couple of
-   ohms. 120 means one, 40 means three, 30 means four, open means none, near
-   zero means a short.
-2. Same conditions, CANH to ground and CANL to ground. Both should be
-   megohms. Tens of ohms means a short to ground somewhere.
-3. Power on, bus idle. CANH and CANL should both sit near 2.5 V with respect to
-   ground for a 5 V transceiver, and their difference should be under 0.5 V.
-4. Scope, two channels on CANH and CANL, math channel set to A minus B. During
-   traffic, dominant should be 1.5 to 3.0 V differential and recessive under
-   0.5 V. Look specifically at the dominant-to-recessive edge. If it rings,
-   overshoots, or takes a large fraction of a bit to settle, your termination
-   is wrong or your stubs are too long. That edge is the sensitive one.
-
-**Layout, while you are here.** Daisy-chain, never star. Keep the pair twisted
-right up to each connector. At 1 Mbit/s the theoretical bus length limit is
-around 40 m and a walking robot is a metre or two, so length is not your
-problem; stub length and star topology are.
-
-### 8.3 Worked exercise: retiming for a 75 MHz kernel clock
-
-You have already made this change in `src/main.cpp`. Do the derivation from
-scratch anyway, without looking, then compare against both the answer and your
-own code.
-
-**The problem.** `fdcan_ker_ck` is now 75 MHz instead of 50 MHz. Keep the bit
-rate at exactly 1 Mbit/s. Choose `NominalPrescaler`, `NominalTimeSeg1`,
-`NominalTimeSeg2` and `NominalSyncJumpWidth`. Aim for an 80% sample point.
-Then say where the sample point actually lands and what that costs.
-
-Constraints you have to respect: the HAL allows `NominalPrescaler` 1 to 512,
-`NominalTimeSeg1` 2 to 256, `NominalTimeSeg2` 2 to 128, and
-`NominalSyncJumpWidth` 1 to 128, with `SJW <= min(Seg1, Seg2)`.
-
-Stop here and work it out.
-
----
-
-**Answer.**
-
-Step 1. The bit rate equation has only one unknown product:
-
-```
-  bit_rate = fdcan_ker_ck / (prescaler * N_tq)
-  1e6      = 75e6 / (prescaler * N_tq)
-  prescaler * N_tq = 75
-```
-
-Step 2. Factor 75. There are only six options, and most are unusable:
-
-| prescaler | N_tq | t_q | usable |
-|---|---|---|---|
-| 1 | 75 | 13.33 ns | yes |
-| 3 | 25 | 40.00 ns | yes |
-| 5 | 15 | 66.67 ns | yes |
-| 15 | 5 | 200.00 ns | technically, but Seg1 and Seg2 are both 2 minimum, so the best sample point is 3/5 = 60% |
-| 25 | 3 | 333 ns | no, Seg1 + Seg2 would be 2 and each has a minimum of 2 |
-| 75 | 1 | 1000 ns | no |
-
-Step 3. Split each usable N_tq for 80%. The sample point is `(1 + Seg1) / N_tq`,
-so you want `1 + Seg1 = 0.80 * N_tq`:
-
-| prescaler | N_tq | Seg1 | Seg2 | SJW | sample point |
-|---|---|---|---|---|---|
-| 1 | 75 | 59 | 15 | 15 | 60/75 = **80.00%** |
-| 3 | 25 | 19 | 5 | 5 | 20/25 = **80.00%** |
-| 5 | 15 | 11 | 3 | 3 | 12/15 = **80.00%** |
-
-All three are exact, because 75 is divisible by 5 and 80% is 4/5. That is luck,
-and it is the reason 75 MHz is a pleasant clock for 1 Mbit/s. Verify one:
-
-```
-  75e6 / (3 * 25) = 75e6 / 75 = 1 000 000 bit/s      exact
-  (1 + 19) / 25   = 0.80                             exact
-```
-
-Step 4. Compare with what is in your code:
-
-```c
-hfdcan1.Init.NominalPrescaler     = 5;
-hfdcan1.Init.NominalTimeSeg1      = 12;    // -> 15 tq, sample point 13/15
-hfdcan1.Init.NominalTimeSeg2      = 2;
-hfdcan1.Init.NominalSyncJumpWidth = 2;
-```
-
-The bit rate is right, 1.000 Mbit/s exactly. The sample point is 86.67%, not
-80%. Whoever retimed it kept `Seg2 = 2` from the 50 MHz configuration and put
-all five extra time quanta into `Seg1`. That is a choice, not a mistake, but it
-is a choice with two consequences.
-
-**The tradeoff.** From section 4.2, a later sample point means a shorter
-Phase_Seg2, and Phase_Seg2 is what the oscillator tolerance depends on:
-
-| config | sample point | oscillator tolerance | transceiver loop budget, 2 m bus |
-|---|---|---|---|
-| p5, 12/2, SJW 2 (your code) | 86.67% | +/- 0.518% | 323 ns |
-| p5, 11/3, SJW 3 | 80.00% | +/- 0.781% | 257 ns |
-| p3, 19/5, SJW 5 | 80.00% | +/- 0.781% | 257 ns |
-| p1, 59/15, SJW 15 | 80.00% | +/- 0.781% | 257 ns |
-
-Moving the sample point later trades clock accuracy for propagation delay,
-one for one. Your 86.67% buys 66 ns of extra transceiver budget and costs you a
-third of your clock tolerance. With a TJA1051T/3's 250 ns worst-case loop
-delay, 80% leaves 7 ns of margin and 86.67% leaves 73 ns, so the case for
-keeping 86.67% is real, provided every node on the bus has a crystal. If any
-ESC is RC-clocked, 0.518% is not survivable and you should be at 80% with a
-faster transceiver instead.
-
-**The other thing the table shows.** All three 80% rows have identical
-tolerance. More time quanta does not buy accuracy. What it buys is
-*resolution*: at 15 tq the sample point moves in 6.67% steps, at 25 tq in 4.0%
-steps, at 75 tq in 1.33% steps. That matters when an ESC vendor specifies a
-sample point you have to land near. If you want the flexibility for free, use
-`prescaler = 3, Seg1 = 19, Seg2 = 5, SJW = 5`: exactly 1 Mbit/s, exactly 80%,
-a 5 tq jump width, and 4% granularity if you need to move.
-
-**The failure you avoided.** If the clock had gone to 75 MHz and the timing had
-*not* been retimed, `75e6 / (5 * 10)` is 1.5 Mbit/s and nothing would talk. And
-if the timing was retimed but the clock is still 50 MHz for some reason,
-`50e6 / (5 * 15)` is 666.7 kbit/s and nothing would talk. Both are silent in
-software. This is the third time this document has told you to print the kernel
-clock.
-
-### 8.4 Debugging a bus that does not work
-
-Ordered by cost. Do not skip ahead; each step is cheaper than the one after it
-and eliminates more.
-
-**Free, software only**
-
-1. **Print the clocks.** Section 0. `fdcan_ker_ck`, SYSCLK, and the PLL source.
-   If the kernel clock is not what your bit timing assumes, stop here; nothing
-   else matters. Five minutes.
-2. **Print the protocol status and error counters, once a second.** Section
-   7.3, and the interpretation table there. This one addition identifies most
-   of the failures in this document by name. If you do exactly one thing on
-   this list, do this one.
-3. **Verify your bit timing arithmetic against the register.** Read
-   `FDCAN1->NBTP` and decode it. `NBRP`, `NTSEG1` and `NTSEG2` are all stored
-   minus one, so what you read back should be prescaler 4, seg1 11, seg2 1 for
-   the values in your code. If they do not match what you set,
-   `HAL_FDCAN_Init` rejected something.
-4. **Run `FDCAN_MODE_EXTERNAL_LOOPBACK`.** Section 8.1. Real frames on the real
-   wire, no ACK needed, no error counters climbing. Everything from step 6
-   onward is easier to do in this mode.
-5. **Run `FDCAN_MODE_BUS_MONITORING` with one ESC transmitting.** If frames
-   arrive, your bit timing and filter are correct and the problem is on your
-   transmit side. If they do not, and the ESC is definitely sending, your bit
-   rate does not match theirs.
-
-**Multimeter**
-
-6. **Power off. 60 ohm across CANH-CANL.** Section 8.2. Then CANH to ground and
-   CANL to ground: both megohms.
-7. **Power on, bus idle. Transceiver pins.** `VCC` 5 V, `VIO` 3.3 V, `STB`/`S`
-   at 0 V. CANH and CANL both near 2.5 V, difference under 0.5 V. A floating
-   `STB` pin is the single most common first-board fault and this is where you
-   catch it.
-8. **Continuity end to end** on CANH and on CANL, and confirm they are not
-   swapped at any connector. Swapped CANH/CANL is not fatal for a single link
-   but it is fatal on a shared bus.
-
-**Oscilloscope, one channel**
-
-9. **Probe PH13 with the controller transmitting.** Are there bits at all? Then
-   measure the width of one bit with the cursors. It must be 1.00 us. This is
-   the direct measurement that steps 1 and 3 were inferring. If it reads
-   1.50 us your kernel clock is 50 MHz, not 75.
-10. **Probe PI9.** In external loopback with a live transceiver it should
-    mirror PH13, delayed. Stuck high means the transceiver is not driving the
-    bus: check `STB`, `VCC`, and the TXD connection. Stuck low means something
-    is holding the bus dominant.
-
-**Oscilloscope, two channels**
-
-11. **PH13 and PI9 together. Measure the loop delay.** Cursor the delay from a
-    PH13 falling edge to the corresponding PI9 falling edge. That is the number
-    section 3.4 budgeted. If it exceeds the budget you computed, your sample
-    point is too early for your transceiver and you have found a real cause of
-    intermittent errors.
-12. **CANH and CANL, math channel A minus B.** Dominant 1.5 to 3.0 V, recessive
-    under 0.5 V. Study the dominant-to-recessive edge for ringing. Section 8.2.
-13. **Trigger on SOF and count to the ACK slot.** For an FD base frame with a
-    32-byte payload, counting SOF as bit 1, the fields run: 22 bits of header,
-    256 of data, 4 of stuff count, 21 of CRC, 1 CRC delimiter, and then the ACK
-    slot at bit 305. Trigger on the falling edge that starts the frame, set the
-    horizontal delay to 300 us, and look at the differential in the window that
-    follows. Stuff bits push it later, so search 304 to 380 us rather than
-    expecting an exact position. If the bus goes dominant in the ACK slot while
-    your own TX pin is recessive, someone acknowledged you. That is direct
-    proof a second node is alive and agrees with your bit timing, and it is the
-    single most informative measurement on this list.
-14. **Scope an ESC's own transmission and measure its bit width.** If it is not
-    1.00 us you have a bit rate mismatch, and now you know which side is wrong.
-
-**Bisection**
-
-15. **Disconnect all ESCs but one.** Then add them back one at a time. A single
-    node with the wrong bit rate, no crystal, or a classic-only CAN controller
-    (section 5.2) breaks the whole bus, and this finds it in three iterations.
-
-**Build the analyser you do not own**
-
-16. **Second MCU in `FDCAN_MODE_BUS_MONITORING`.** Any spare FDCAN-capable part,
-    accept-all filter, dump identifier, DLC and payload bytes over serial. Bus
-    monitoring never drives a dominant bit and never acknowledges, so it cannot
-    disturb a bus that is working. This is a free CAN analyser and it is worth
-    the afternoon; a real one costs money and this one you can leave soldered
-    to the robot.
-
-
-## 9. Exercises
-
-Work them before reading the answers. They are all things you will actually
-have to do.
-
-**E1.** Your kernel clock is 75 MHz. You need 500 kbit/s for a slower auxiliary
-bus, sample point 80%. Give prescaler, Seg1, Seg2, SJW.
+| `TEC=0 REC=0 lec=none` | nothing transmitted, or everything worked |
+| `TEC=128 passive=1 lec=ack`, frozen | transmitting, nobody acknowledging. Section 14, case one |
+| `TEC` climbing to 256, `lec=bit0` | dominant bits not coming back. Transceiver disabled, unpowered, or absent |
+| `lec=bit1` while idle | something else holding the bus dominant. Shorted pair, or a stuck node |
+| `lec=stuff` / `form`, intermittent | bit rate mismatch, bad termination, or a clock out of tolerance (4.3) |
+| `lec=crc` | corruption on the wire. Reflections, noise, missing twist |
+| `busoff=1` | 32+ consecutive failed transmissions. Recover explicitly (7.3) |
+
+Beyond that, the ordered debugging sequence is: print the clocks, print the
+status, verify the timing registers read back what you set, run external
+loopback, run bus monitoring against one live node. Then reach for a
+multimeter (60 ohm across the pair, power off), then a scope (measure one bit
+width — it must be exactly the period your bit rate implies), then bisect by
+disconnecting nodes.
+
+A second MCU in bus-monitoring mode with an accept-all filter, dumping frames
+over serial, is a free CAN analyser. Bus monitoring never drives a dominant bit
+and never acknowledges, so it cannot disturb a working bus.
+
+## 16. Open items
+
+Roughly in the order they will hurt.
+
+**Before driving a real bus**
+
+1. Confirm `fdcan_ker_ck` on hardware (section 10). The bit timing assumes it.
+2. Add the protocol status dump (15). Without it, every failure in 14 is
+   invisible.
+3. Put a pull-up on the RX pin (1.4). A floating pin generates errors that
+   never happened.
+4. Confirm every ESC is CAN FD *capable*, not merely FD-tolerant (5.2).
+5. Walk the ladder in 14 rather than going straight to normal mode.
+
+**Correctness**
+
+6. Check the return value of `CAN_SendActions()` (12).
+7. Decode `rx.DataLength` before copying (13, 5.3).
+8. Add per-ESC last-seen timestamps and a staleness mask (13).
+9. Widen the receive window, or move to interrupt-driven receive (13).
+10. Add a bus-off handler, and decide what the gait does when the motor bus
+    dies (7.3).
+
+**Tidying**
+
+11. Tighten the filter to a range of 0x200 to 0x207, or mask 0x7F8 (13).
+12. Choose the sample point deliberately rather than inheriting it (4.2).
+13. Reserve 0x000-0x0FF for emergency stop and faults (11).
+14. Keep `PINOUT.md` in step with the code. Two sources of truth that disagree
+    are worse than one that is wrong, because you will trust whichever you read
+    last.
+
+**Not now, but know why**
+
+15. Leave BRS off until the bandwidth arithmetic says otherwise (5.4, 12).
+16. If the FIFO ever gives ordering or starvation trouble, the redesign is one
+    dedicated receive buffer per ESC (6.1).
+
+
+# Part III — Exercises
+
+Work them before reading the answers.
+
+**E1.** A controller has a 75 MHz kernel clock. Configure it for 500 kbit/s at
+an 80% sample point. Give prescaler, TimeSeg1, TimeSeg2 and SJW.
 
 **E2.** For the configuration you just derived, compute the maximum oscillator
-tolerance from both ISO conditions, and say which one binds.
+tolerance from both ISO conditions and say which one binds.
 
-**E3.** You want to send 20 bytes in one frame. Which `FDCAN_DLC_BYTES_*`
-constant? Now you want 36 bytes. What do you do?
+**E3.** You want to send 20 bytes in one CAN FD frame. Which DLC? Now you want
+36 bytes. What do you do?
 
-**E4.** A colleague sets `FilterID1 = 0x180`, `FilterID2 = 0x780`,
-`FilterType = FDCAN_FILTER_MASK`. Which identifiers reach the FIFO?
+**E4.** A mask filter is set to `FilterID1 = 0x180`, `FilterID2 = 0x780`. Which
+identifiers reach the FIFO, and how many are there?
 
-**E5.** Three nodes start transmitting in the same bit time, with identifiers
+**E5.** Three nodes start transmitting in the same bit time with identifiers
 0x100, 0x080 and 0x101. Who wins, and at which identifier bit does each loser
 drop out? Then: what happens if two nodes transmit identifier 0x100 with
-different payloads in the same bit time?
+*different* payloads in the same bit time?
 
-**E6.** You add FDCAN2 with 4 standard filters, an 8-element Rx FIFO0 of
-16-byte elements, and a 4-element Tx FIFO of 16-byte elements. How many words
-does it need, what must you set `MessageRAMOffset` to, and does it fit?
+**E6.** A second CAN instance needs 4 standard filters, an 8-element receive
+FIFO of 16-byte elements, and a 4-element transmit FIFO of 16-byte elements. A
+16-byte element is 2 header words plus 4 data words. The first instance already
+occupies words 0 to 576 of a 2560-word pool. How many words does the second
+need, what must its base offset be, and does it fit?
 
-**E7.** You change the ESC feedback to FD frames carrying 32 bytes each, still
-at 50 Hz. What is the new bus load, and what does it do to the 2 ms window in
-`Model()`?
+**E7.** A 20 ms control cycle carries one 32-byte FD command frame plus eight
+8-byte replies. An FD frame with 32 bytes and no BRS is 316 bit times including
+intermission; an 8-byte one is 120. At 1 Mbit/s, what is the bus load? Now
+change the replies to 32-byte FD frames — what is the new load, and what does
+it do to a 2 ms receive window?
 
-**E8.** Your ESC datasheet specifies a sample point of 87.5%. Must yours match?
+**E8.** A device datasheet specifies an 87.5% sample point. Must yours match?
 Can you hit 87.5% exactly at 1 Mbit/s from a 75 MHz kernel clock?
 
-**E9.** Name the fault for each of these, printed by `CAN_ReportStatus()`:
+**E9.** Name the fault for each status readout:
 
 ```
-  (a) TEC=248 REC=0 lec=bit0   warn=1 passive=1 busoff=0   and climbing fast
-  (b) TEC=128 REC=0 lec=ack    warn=1 passive=1 busoff=0   and not changing
-  (c) TEC=0   REC=37 lec=stuff warn=0 passive=0 busoff=0   REC creeping up
-  (d) TEC=0   REC=0  lec=bit1  warn=0 passive=0 busoff=0   bus should be idle
+  (a) TEC=248 REC=0  lec=bit0  passive=1 busoff=0   and climbing fast
+  (b) TEC=128 REC=0  lec=ack   passive=1 busoff=0   and not changing
+  (c) TEC=0   REC=37 lec=stuff passive=0 busoff=0   REC creeping up
+  (d) TEC=0   REC=0  lec=bit1  passive=0 busoff=0   bus should be idle
 ```
 
 ---
 
-### Answers
+## Answers
 
-**E1.** `prescaler * N_tq = 75e6 / 500e3 = 150`. Factor it: 2 x 75, 6 x 25,
-10 x 15 are all usable. Take `prescaler = 6, N_tq = 25`, then
-`1 + Seg1 = 0.80 * 25 = 20`, so `Seg1 = 19`, `Seg2 = 5`, `SJW = 5`.
+**E1.** `prescaler * N_tq = 75e6 / 500e3 = 150`. Factor it: 2x75, 6x25 and
+10x15 are all usable. Take `prescaler = 6, N_tq = 25`. Then
+`1 + TimeSeg1 = 0.80 * 25 = 20`, so `TimeSeg1 = 19`, `TimeSeg2 = 5`, `SJW = 5`.
 Check: `75e6 / (6 * 25) = 500 000` exactly, sample point `20/25 = 80.0%`.
 
 **E2.**
 
 ```
-  (1)  SJW / (2 * 10 * N_tq)                = 5 / (2*10*25)      = 5/500 = 1.000%
-  (2)  min(PhSeg1,PhSeg2) / (2*(13*N_tq - PhSeg2)) = 5 / (2*(325-5)) = 5/640 = 0.781%
+  (1)  SJW / (2 * 10 * N_tq)                        = 5 / 500 = 1.000%
+  (2)  min(PhSeg1,PhSeg2) / (2*(13*N_tq - PhSeg2))  = 5 / (2*(325-5)) = 0.781%
 ```
 
-Condition (2) binds, at +/- 0.781%. Same as every other 80% configuration, which
-is the point section 4.2 was making: tolerance follows the sample point, not
+Condition (2) binds, at +/- 0.781% — the same as every other 80% configuration,
+which is the point section 4.2 makes. Tolerance follows the sample point, not
 the time quantum count.
 
-**E3.** 20 bytes is `FDCAN_DLC_BYTES_20`, which is DLC 11. 36 bytes does not
-exist. The encoding goes 32, 48, 64 with nothing between, so you either send 48
-and pad 12 bytes you will pay for on the wire, or split into two frames, or
-redesign the payload down to 32. Design payloads to land on 0-8, 12, 16, 20,
-24, 32, 48 or 64.
+**E3.** 20 bytes is DLC 11. 36 bytes does not exist: the encoding goes 32, 48,
+64 with nothing between. Send 48 and pad 12 bytes you pay for on the wire,
+split into two frames, or redesign the payload down to 32.
 
-**E4.** Accept when `(id & 0x780) == (0x180 & 0x780) = 0x180`. The mask 0x780
-pins ID10 to ID7 and leaves ID6 to ID0 free, so the accepted set is
-**0x180 to 0x1FF**, 128 identifiers.
+**E4.** Accept when `(id & 0x780) == (0x180 & 0x780) = 0x180`. The mask pins
+ID10 down to ID7 and leaves ID6 to ID0 free, so the accepted set is **0x180 to
+0x1FF**, 128 identifiers.
 
 **E5.**
 
@@ -1547,162 +1164,79 @@ pins ID10 to ID7 and leaves ID6 to ID0 free, so the accepted set is
                            ^
 ```
 
-0x080 wins at ID8: it sends dominant while the other two send recessive, so
-both of them lose there, on the same bit. Later, when 0x100 and 0x101 retry
-together, they tie all the way to ID0, where 0x100 sends dominant and wins.
-Lower identifier always wins, and it wins at the most significant bit where the
-identifiers differ.
+0x080 wins at ID8, where it sends dominant and the other two send recessive —
+so both lose on the same bit. Later, when 0x100 and 0x101 retry together, they
+tie all the way to ID0, where 0x100 sends dominant and wins.
 
-Two nodes sending 0x100 with different payloads is the failure case. They tie
-through the entire identifier, through RRS, IDE, FDF and DLC if those match,
-and neither knows it lost. At the first data bit where the payloads differ, one
-node transmits recessive and samples dominant *outside* the arbitration field,
-which is a bit error, not a lost arbitration. Both frames are destroyed, both
-error counters climb, and both retransmit and collide again. One identifier,
-one transmitter. Always.
+Two nodes sending 0x100 with different payloads is the failure case from 2.2.
+They tie through the entire identifier and neither knows it lost. At the first
+data bit where the payloads differ, one transmits recessive and samples
+dominant *outside* the arbitration field — a bit error, not a lost arbitration.
+Both frames are destroyed, both counters climb, and both retransmit and collide
+again. One identifier, one transmitter, always.
 
-**E6.** A 16-byte element is 2 header words plus 4 data words, 6 words. So
-`4 * 1 + 8 * 6 + 4 * 6 = 4 + 48 + 24 = 76 words`. FDCAN1 occupies words 0 to
-576, so FDCAN2 needs `MessageRAMOffset = 577`. Total 653 words of 2560, about
-26%. It fits comfortably. If you forget the offset, both peripherals write from
-word 0 and corrupt each other, which presents as random garbage in both.
+**E6.** `4*1 + 8*6 + 4*6 = 4 + 48 + 24 = 76 words`. The first instance occupies
+words 0 to 576, so the base offset must be **577**. Total 653 of 2560 words,
+about 26% — it fits comfortably. Forget the offset and both peripherals write
+from word 0 and corrupt each other, presenting as random garbage in both (6.3).
 
-**E7.** An FD frame with 32 bytes and no BRS is 316 bit times including
-intermission. Nine of them per cycle:
-`9 * 316 = 2844 bits = 2844 us`, so bus load goes from 6.0% to
-**2844 / 20000 = 14.2%**. Still fine for the bus. Not fine for `Model()`: the
-existing `vTaskDelay(pdMS_TO_TICKS(2))` gives 1 to 2 ms and you now need at
-least 2.85 ms of bus time plus ESC latency. You would be polling before even
-half the replies had arrived. Widen the window to 4 ms or move to the
-notification-driven receive in section 6.4.
+**E7.** `316 + 8*120 = 1276 bit times = 1276 us`, so
+`1276 / 20000 =` **6.4%**. With 32-byte replies it becomes `9 * 316 = 2844 us`,
+or **14.2%**. Still fine for the bus, but not for a 2 ms window: you now need
+at least 2.85 ms of wire time before the last reply lands, so you would be
+polling before even half the replies had arrived. Widen the window or move to
+interrupt-driven receive (13).
 
-**E8.** No, sample points do not have to match. Nodes must agree on the bit
-*rate*; each node independently picks its own prescaler, time quantum count and
-sample point, and independently has to satisfy its own oscillator tolerance and
-propagation constraints. A node with an 80% sample point and a node with an
-87.5% sample point interoperate.
+**E8.** No — nodes must agree on the bit *rate*, not the sample point. Each
+node independently picks its own prescaler, tq count and sample point, and
+independently satisfies its own tolerance and propagation constraints (4.2).
 
-You cannot hit 87.5% exactly anyway. 87.5% is 7/8, so `1 + Seg1` must be
-`7/8 * N_tq`, which needs `N_tq` divisible by 8. But `prescaler * N_tq = 75`
-and 75 has no factor of 8. The closest you can get at 15 tq is 86.67%; at 25 tq
-it is 88.0% (`Seg1 = 21, Seg2 = 3`); at 75 tq it is 86.67% or 88.0%. Aim for
-the neighbourhood and satisfy the two constraints; the exact figure is not
-sacred.
+You cannot hit 87.5% exactly anyway. 87.5% is 7/8, so `1 + TimeSeg1` must be
+`7/8 * N_tq`, which needs N_tq divisible by 8 — but `prescaler * N_tq = 75` and
+75 has no factor of 8. The closest at 15 tq is 86.67%; at 25 tq it is 88.0%.
+Aim for the neighbourhood and satisfy the two constraints; the exact figure is
+not sacred.
 
 **E9.**
 
-(a) `lec=bit0` and TEC climbing fast means the node sends dominant and samples
-recessive: its dominant bits are not reaching the bus. Transceiver unpowered,
-`STB`/`S` not pulled low, TXD not connected, or no transceiver fitted. It will
-be bus-off within a millisecond. Case B in section 8.1.
+**(a)** `lec=bit0` with TEC climbing fast: the node sends dominant and samples
+recessive, so its dominant bits are not reaching the bus. Transceiver
+unpowered, standby pin not asserted, TXD not connected, or no transceiver
+fitted. It will be bus-off within a millisecond — the second case in section 14.
 
-(b) `lec=ack` with TEC frozen at exactly 128 means the frames are getting out
-correctly and nobody is acknowledging. There is no other functioning node on
-the bus, or every other node is in bus monitoring mode or bus-off. Case A in
-section 8.1. TEC is frozen because of the error-passive ACK exception in
-section 7.2; this node will retransmit forever and never go bus-off.
+**(b)** `lec=ack` with TEC frozen at exactly 128: frames are getting out
+correctly and nobody is acknowledging. No other functioning node on the bus, or
+every other node is in bus-monitoring mode or bus-off. The freeze is the
+error-passive ACK exception from 7.2, which is why this node retransmits
+forever and never goes bus-off — the first case in section 14.
 
-(c) TEC zero and REC creeping up with `lec=stuff` means you are *receiving*
-frames that are being corrupted. You are not the transmitter, so you are not to
-blame, but something on the bus is: a node whose bit rate does not match,
-a node whose clock is outside the tolerance from section 4, reflections from
-bad termination, or a classic-only controller error-flagging your FD frames
-(section 5.2). Scope the differential pair.
+**(c)** TEC zero and REC creeping with `lec=stuff`: you are *receiving* frames
+that are being corrupted. You are not the transmitter, so you are not at fault,
+but something on the bus is — a node whose bit rate does not match, a node
+whose clock is outside tolerance (4.3), reflections from bad termination (8.1),
+or a classic-only controller error-flagging FD frames (5.2). Scope the pair.
 
-(d) `lec=bit1` on an idle bus means the node sent recessive and sampled
-dominant when nothing should be driving. Something is holding the bus dominant:
-CANH shorted to CANL, a shorted transceiver, or a node stuck transmitting.
-Power everything down and go to step 6 of the debug checklist.
-
-
-## 10. The change list
-
-Ordered by what will hurt most if you skip it. Nothing here is speculative;
-each item is a line in `src/main.cpp` or `PINOUT.md`.
-
-**Before you flash `FDCAN_MODE_NORMAL` again**
-
-1. Add `ReportClocks()` from section 0 and confirm `fdcan_ker_ck` is 75000000
-   and the PLL source is HSE. If it is not, your bus is not at 1 Mbit/s.
-2. Add `CAN_ReportStatus()` from section 7.3 on a one-second timer. Without it
-   every failure in section 8.1 is invisible.
-3. Set `GPIO_PULLUP` on PI9 in `HAL_FDCAN_MspInit()`. A floating RX pin
-   generates errors that never happened.
-4. Confirm all eight ESCs use CAN FD capable controllers, not classic-only
-   (section 5.2). This is a datasheet check and it is the most expensive thing
-   to find out late.
-5. Walk the bring-up ladder in section 8.1 rather than going straight to
-   normal mode: internal loopback, external loopback, bus monitoring against
-   one live ESC, normal with one ESC, normal with eight.
-
-**Correctness**
-
-6. Check the return value of `CAN_SendActions()` in `Model()`. It is your only
-   in-band signal that the Tx FIFO has wedged.
-7. Decode `rx.DataLength` in `CAN_Poll()` before copying 8 bytes
-   (section 5.3). Today a short frame feeds stale buffer contents to the
-   network as a joint position.
-8. Add per-ESC `last_seen` timestamps and a staleness mask (section 6.4). A
-   silent ESC currently looks identical to a stationary one.
-9. Widen the receive window. `vTaskDelay(pdMS_TO_TICKS(2))` is 1 to 2 ms at the
-   default tick rate and the bus needs at least 1204 us. Use 4 ms, or move to
-   the notification-driven receive.
-10. Add the bus-off handler from section 7.4. FDCAN never recovers by itself,
-    and decide what the gait does when the motor bus dies.
-
-**Tidying**
-
-11. Tighten the filter to `FDCAN_FILTER_RANGE` 0x200 to 0x207, or mask 0x7F8
-    (section 6.2). You currently accept 256 identifiers to use 8.
-12. Decide the sample point deliberately. `Seg1 = 12, Seg2 = 2` gives 86.67%
-    and 0.518% clock tolerance; `Seg1 = 11, Seg2 = 3, SJW = 3` gives 80.0% and
-    0.781%; `prescaler = 3, Seg1 = 19, Seg2 = 5, SJW = 5` gives the same 80%
-    with finer granularity to move later. Section 8.3 has the reasoning.
-13. Reserve 0x000 to 0x0FF for emergency stop and fault reporting, above your
-    commands (section 2.2).
-14. Update `PINOUT.md`. It says internal loopback, 50 MHz, HSI and PLL2
-    `M=4 N=9 FRACN=3072`; the code says normal mode, 75 MHz, HSE and PLL2
-    `M=2 N=12 FRACN=0`. Two sources of truth that disagree is worse than one
-    that is wrong, because you will trust whichever one you read last.
-15. Note in `PINOUT.md` that PH0 is now load-bearing. `SystemClock_Config()`
-    selects HSE, so the crystal is required for the board to boot at all: with
-    no HSE, `HAL_RCC_OscConfig` times out and `Error_Handler()` hangs before
-    `setup()` reaches `Serial_.begin()`. Confirm whether the design uses a
-    crystal on PH0 and PH1 (`RCC_HSE_ON`, which is what the code says) or a
-    clock input on PH0 alone (`RCC_HSE_BYPASS`), because those need different
-    parts fitted.
-
-**Not now, but know why**
-
-16. Leave BRS off. Your bus load is 6% and your data timing is currently a copy
-    of your nominal timing, so turning it on would change nothing except adding
-    a transmitter-delay-compensation problem (section 5.4).
-17. Leave `RxFifo0ElmtSize` at 64 bytes. It costs 1728 bytes of a 10 Kbyte pool
-    you are not using, and a frame longer than the element size is silently
-    truncated rather than rejected.
-18. If the FIFO ever gives you ordering or starvation trouble, the redesign is
-    eight dedicated Rx buffers, one per ESC, via `FDCAN_FILTER_TO_RXBUFFER`
-    (section 6.2). Your topology is the case that feature exists for.
+**(d)** `lec=bit1` on an idle bus: the node sent recessive and sampled dominant
+when nothing should be driving. Something is holding the bus dominant — CANH
+shorted to CANL, a shorted transceiver, or a node stuck transmitting. Power
+down and measure resistance across the pair (8.1).
 
 
-## Reference
+# Reference
 
-Numbers in this document were derived from `src/main.cpp` as committed, and
-checked against:
+Checked against:
 
 - ISO 11898-1 error-confinement and bit-timing rules, as summarised in TI
   SPRAC35, *Calculator for CAN Bit Timing Parameters*.
 - ST AN5348, *Introduction to FDCAN peripherals for STM32 MCUs*, for message
-  RAM element sizes and Rx FIFO blocking versus overwrite behaviour.
-- `stm32h7xx_hal_fdcan.h` from the STM32H7 HAL driver, for the DLC constants,
-  the protocol status and error counter structures, and the operating modes.
+  RAM element sizes and receive FIFO blocking versus overwrite behaviour.
+- `stm32h7xx_hal_fdcan.h`, for the DLC constants, the protocol status and error
+  counter structures, and the operating modes.
 - ST's note *How to recover from bus-off state with FDCAN on STM32 MCUs*, for
-  the fact that the H7 has no automatic bus-off recovery and the `CCCR.INIT`
-  procedure.
+  the absence of automatic bus-off recovery and the `CCCR.INIT` procedure.
 - NXP TJA1051 data sheet, for the 250 ns worst-case loop delay used in the
-  propagation budget.
-- STM32H742xI/G, STM32H743xI/G data sheet, for HSI accuracy and the HSE range.
+  propagation budget in 3.3.
 
-Confirm the transceiver number against whatever part you actually fit, and the
-HSI figures against your datasheet revision. Everything else follows from
-arithmetic you can redo.
+Confirm transceiver numbers against whatever part you actually fit, and
+oscillator accuracy figures against your own datasheet revision. Everything
+else follows from arithmetic you can redo.
